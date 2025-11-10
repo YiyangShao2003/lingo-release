@@ -9,6 +9,9 @@ import os
 from torch.utils.tensorboard import SummaryWriter
 import datetime
 from datasets.lingo import LingoDataset
+from tqdm import tqdm
+import time
+import wandb
 
 os.environ['ROOT_DIR'] = '..'
 os.environ['HYDRA_FULL_ERROR'] = '1'
@@ -58,12 +61,64 @@ def train_ddp(rank, world_size, cfg):
 
     if cfg.use_tensorboard and rank == 0:
         writer = SummaryWriter(log_dir=os.path.join(cfg.exp_dir, 'tensorboard_logs'))
+    
+    if cfg.use_wandb and rank == 0:
+        # Try to resolve config, but fallback to unresolved if interpolation errors occur
+        try:
+            wandb_config = OmegaConf.to_container(cfg, resolve=True)
+        except Exception:
+            # If resolution fails (e.g., missing interpolation keys), use unresolved config
+            wandb_config = OmegaConf.to_container(cfg, resolve=False)
+        
+        # Create informative run name with key hyperparameters
+        run_name = f"{cfg.exp_name}_bs{cfg.batch_size}_lr{cfg.lr}_ws{cfg.max_window_size}_{cfg.scene_type}"
+        if hasattr(cfg, 'CURRENT_TIME') and cfg.CURRENT_TIME:
+            run_name += f"_{cfg.CURRENT_TIME}"
+        elif os.environ.get('CURRENT_TIME'):
+            run_name += f"_{os.environ.get('CURRENT_TIME')}"
+        
+        wandb.init(
+            project=cfg.wandb_project if hasattr(cfg, 'wandb_project') else 'lingo-training',
+            name=run_name,
+            config=wandb_config,
+            dir=cfg.exp_dir
+        )
 
-    for epoch in range(cfg.epochs):
-        print(f'Start epoch {epoch}', flush=True)
+    # Only show progress bar on rank 0
+    pbar_epochs = tqdm(
+        range(cfg.epochs), 
+        desc='Training Progress', 
+        disable=(rank != 0), 
+        position=0,
+        unit='epoch',
+        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+    )
+    
+    for epoch in pbar_epochs:
         sampler.set_epoch(epoch)
+        
+        # Create progress bar for dataloader (step-level)
+        if rank == 0:
+            pbar_batches = tqdm(
+                dataloader, 
+                desc=f'Epoch {epoch+1}/{cfg.epochs}', 
+                disable=False, 
+                position=1, 
+                leave=False,
+                unit='step',
+                unit_scale=False,
+                ncols=120,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+            )
+        else:
+            pbar_batches = dataloader
+        
+        running_loss = 0.0
         step = 0
-        for batch in dataloader:
+        epoch_start_time = time.time()
+        
+        for batch in pbar_batches:
+            step_start_time = time.time()
             step += 1
             optimizer.zero_grad()
 
@@ -81,24 +136,76 @@ def train_ddp(rank, world_size, cfg):
 
             loss = trainer.p_losses(joints, mat, scene_flag, mask, t, text_clip_embedding, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi, is_loco)
 
-            if step % 10 == 0:
-                print(f"Epoch: {epoch}, Step: {step} / {len(dataloader)}   Loss: {loss.item()}", flush=True)
-                if cfg.use_tensorboard and rank == 0:
-                    writer.add_scalar('Loss', loss.item(), epoch * len(dataloader) + step)
-
             loss.backward()
             optimizer.step()
+            
+            # Calculate step time
+            step_time = time.time() - step_start_time
+            steps_per_sec = 1.0 / step_time if step_time > 0 else 0.0
+            
+            # Update statistics
+            loss_item = loss.item()
+            running_loss += loss_item
+            
+            # Update batch progress bar with detailed info
+            if rank == 0:
+                avg_loss = running_loss / step
+                pbar_batches.set_postfix({
+                    'loss': f'{loss_item:.6f}',
+                    'avg': f'{avg_loss:.6f}',
+                    'speed': f'{steps_per_sec:.2f} step/s'
+                })
+            
+            # Log to tensorboard
+            if cfg.use_tensorboard and rank == 0:
+                writer.add_scalar('Loss', loss_item, epoch * len(dataloader) + step)
+                writer.add_scalar('Loss/Average', running_loss / step, epoch * len(dataloader) + step)
+                writer.add_scalar('Training/Speed', steps_per_sec, epoch * len(dataloader) + step)
+            
+            # Log to wandb
+            if cfg.use_wandb and rank == 0:
+                wandb.log({
+                    'Loss': loss_item,
+                    'Loss/Average': running_loss / step,
+                    'Training/Speed': steps_per_sec,
+                    'epoch': epoch,
+                    'step': epoch * len(dataloader) + step
+                })
+
+        # Update epoch progress bar
+        if rank == 0:
+            epoch_avg_loss = running_loss / step if step > 0 else 0.0
+            epoch_time = time.time() - epoch_start_time
+            pbar_epochs.set_postfix({
+                'loss': f'{epoch_avg_loss:.6f}',
+                'lr': f'{cfg.lr:.6f}',
+                'time': f'{epoch_time:.1f}s'
+            })
+            
+            # Log epoch-level metrics to wandb
+            if cfg.use_wandb:
+                wandb.log({
+                    'Epoch/Loss': epoch_avg_loss,
+                    'Epoch/Time': epoch_time,
+                    'Epoch/LearningRate': cfg.lr
+                }, step=epoch)
 
         if rank == 0 and epoch % cfg.ckpt_interval == 0:
-            print(f'Saving checkpoint', flush=True)
+            tqdm.write(f'Saving checkpoint at epoch {epoch}')
             ckpt_folder = os.path.join(cfg.exp_dir, 'checkpoints')
             os.makedirs(ckpt_folder, exist_ok=True)
             torch.save(model.module.state_dict(), os.path.join(ckpt_folder, f"{cfg.exp_name}_epoch{epoch:03d}.pth"))
 
         torch.distributed.barrier()
 
-        print('Clearing cache', flush=True)
+        if rank == 0:
+            tqdm.write('Clearing cache')
         torch.cuda.empty_cache()
+    
+    if rank == 0:
+        pbar_epochs.close()
+        if cfg.use_wandb:
+            wandb.finish()
 
 
 def get_mask(x_start, ind, p, fixed_frame=0, mask_y=True):

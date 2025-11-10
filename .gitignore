@@ -2,3 +2,13 @@ __pycache__/
 .idea/
 *.pyc
 .blend1
+dataset/
+Scene_mesh/
+smpl_models/
+lingo_utils/
+ckpts/
+results/test/
+results/outputs/
+*.zip
+*.blend
+*.jpg

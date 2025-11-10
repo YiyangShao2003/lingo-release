@@ -31,7 +31,8 @@ speed: 0.8
 
 test_setting: demo-21
 exp_dir: ${oc.env:ROOT_DIR}/results/outputs
-ckpt_path: ${oc.env:ROOT_DIR}/ckpts/model/bs128__ws16__scene_occ_two.pth
+ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_epoch040.pth
+# ckpt_path: ${oc.env:ROOT_DIR}/ckpts/model/bs128__ws16__scene_occ_two.pth
 input_path: ${oc.env:ROOT_DIR}/results/inputs/${test_setting}.pkl
 smpl_dir: ${oc.env:ROOT_DIR}/smpl_models
 
