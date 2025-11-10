@@ -184,11 +184,13 @@ def train_ddp(rank, world_size, cfg):
             
             # Log epoch-level metrics to wandb
             if cfg.use_wandb:
+                # Use the same step calculation as step-level logs to maintain monotonicity
+                current_step = (epoch + 1) * len(dataloader)
                 wandb.log({
                     'Epoch/Loss': epoch_avg_loss,
                     'Epoch/Time': epoch_time,
                     'Epoch/LearningRate': cfg.lr
-                }, step=epoch)
+                }, step=current_step)
 
         if rank == 0 and epoch % cfg.ckpt_interval == 0:
             tqdm.write(f'Saving checkpoint at epoch {epoch}')
