@@ -6,7 +6,6 @@ defaults:
   - model:
       - model_smplx
       - synhsi_body
-      - scheduler
   - sampler:
       - pelvis
 
@@ -15,9 +14,6 @@ device: cuda
 batch_size: 1
 interp_s: 3
 
-use_scheduler: true
-scheduler_model_path: ${oc.env:ROOT_DIR}/ckpts/scheduler/scheduler.pth
-scheduler_threshold: 0.7
 locomotion_threshold: 1.0
 
 vis: true
@@ -31,7 +27,8 @@ speed: 0.8
 
 test_setting: demo-21
 exp_dir: ${oc.env:ROOT_DIR}/results/outputs
-ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_epoch040.pth
+# ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_epoch040.pth
+ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_bs128_lr0.0001_ws16_occ_two_2025-11-09_21-39/test_epoch000.pth
 # ckpt_path: ${oc.env:ROOT_DIR}/ckpts/model/bs128__ws16__scene_occ_two.pth
 input_path: ${oc.env:ROOT_DIR}/results/inputs/${test_setting}.pkl
 smpl_dir: ${oc.env:ROOT_DIR}/smpl_models

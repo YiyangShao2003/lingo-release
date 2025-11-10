@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -55,7 +56,7 @@ class Sampler:
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
 
-    def p_losses(self, x_start, mat, scene_flag, mask, t, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi, is_loco, noise=None, loss_type='huber'):
+    def p_losses(self, x_start, mat, scene_flag, mask, t, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco, noise=None, loss_type='huber'):
         if noise is None:
             noise = torch.randn_like(x_start)
 
@@ -112,7 +113,7 @@ class Sampler:
         else:
             occ = None
 
-        predicted_noise = self.model(x_noisy, occ, t, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi)
+        predicted_noise = self.model(x_noisy, occ, t, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir)
 
         mask_inv = torch.logical_not(mask)
 
@@ -128,7 +129,7 @@ class Sampler:
         return loss
 
     @torch.no_grad()
-    def p_sample_loop(self, fixed_points, mat, scene_flag, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi, is_loco):
+    def p_sample_loop(self, fixed_points, mat, scene_flag, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco):
         device = next(self.model.parameters()).device
         shape = (self.batch_size, self.dataset.max_window_size, self.channel)
         points = torch.randn(shape, device=device)
@@ -142,7 +143,7 @@ class Sampler:
 
             points, occ = self.p_sample(model_used, points, fixed_points, mat, scene_flag,
                                         torch.full((self.batch_size,), i, device=device, dtype=torch.long), i,
-                                        text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi, is_loco
+                                        text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco
                                         )
             if self.auto_regre_num > 0:
                 self.set_fixed_points(points, None, fixed_points, mat, joint_id=self.mask_ind, fix_mode=True, fix_goal=False)
@@ -157,7 +158,7 @@ class Sampler:
 
     @torch.no_grad()
     def p_sample(self, model, x, fixed_points, mat, scene_flag, t, t_index,
-                 text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi, is_loco):
+                 text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco):
         betas_t = extract(self.betas, t, x.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(
             self.sqrt_one_minus_alphas_cumprod, t, x.shape
@@ -216,7 +217,7 @@ class Sampler:
             occ = None
 
         model_mean = sqrt_recip_alphas_t * (
-                x - betas_t * model(x, occ, t, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi) / sqrt_one_minus_alphas_cumprod_t
+                x - betas_t * model(x, occ, t, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir) / sqrt_one_minus_alphas_cumprod_t
         )
 
         if t_index == 0:
@@ -246,46 +247,6 @@ class Sampler:
 
         if fixed_points is not None and fix_mode:
             img[:, :fixed_points.shape[1], :] = fixed_points
-
-
-class TimingModel(nn.Module):
-    def __init__(self, dim_input, dim_model, num_heads, dropout_p, num_layers, language_feature_dim):
-        super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(d_model=dim_model,
-                                                   nhead=num_heads,
-                                                   dim_feedforward=dim_model,
-                                                   dropout=dropout_p,
-                                                   activation="gelu")
-        self.dim_model = dim_model
-        self.positional_encoder = PositionalEncoding(
-            dim_model=dim_model, dropout_p=dropout_p, max_len=5000
-        )
-
-        self.transformer = nn.TransformerEncoder(encoder_layer,
-                                                 num_layers=num_layers
-                                                 )
-        self.embedding_input = nn.Linear(dim_input, dim_model)
-        self.out = nn.Linear(dim_model, 1)
-        self.sigmoid = nn.Sigmoid()
-
-        self.embed_timestep = TimestepEmbedder(self.dim_model, self.positional_encoder)
-
-        self.embedding_language = LanguageEncoder(dim_output=dim_model, dim_input=language_feature_dim)
-
-    def forward(self, x, text_emb, pi):
-        need_pi = torch.ones_like(pi, dtype=torch.bool, device=pi.device)
-        language_emb = self.embedding_language(text_emb, pi, need_pi)
-        language_emb = language_emb.permute(1, 0, 2)
-
-        x = x.permute(1, 0, 2)
-        x = self.embedding_input(x) * math.sqrt(self.dim_model)
-
-        x = torch.cat((language_emb, x), dim=0)
-        x = self.positional_encoder(x)
-        x = self.transformer(x)
-        output = self.out(x)[-1]
-
-        return output
 
 
 class Unet(nn.Module):
@@ -369,7 +330,7 @@ class Unet(nn.Module):
 
         self.embed_timestep = TimestepEmbedder(self.dim_model, self.positional_encoder)
 
-    def forward(self, x, cond, timesteps, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi):
+    def forward(self, x, cond, timesteps, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir):
         t_emb = self.embed_timestep(timesteps)  # [b, 1, d]
 
         if not self.load_scene:
@@ -382,7 +343,7 @@ class Unet(nn.Module):
         if not self.load_language:
             language_emb = torch.zeros_like(t_emb)
         else:
-            language_emb = self.embedding_language(text_emb, pi, need_pi)
+            language_emb = self.embedding_language(text_emb)
 
         if not self.load_hand_goal:
             hand_goal_emb = torch.zeros_like(t_emb)
@@ -535,17 +496,20 @@ class LanguageEncoder(nn.Module):
 
         self.embed_pi = ProgressIndicatorEmbedding(dim_output, self.positional_encoder)
 
-    def forward(self, x, pi, need_pi):
+    def forward(self, x, pi=None, need_pi=None):
         # x.shape: [b, 1, 768]
 
         x = self.embedding_input1(x)
-        pi = self.embed_pi(pi)
-
-        # normalization
-        pi = pi / np.sqrt(self.dim_model // 2)
-        not_need_pi = torch.logical_not(need_pi)
-        pi[not_need_pi] = 0.
-        x = x + pi
+        
+        # Only add pi if provided (optional, for backward compatibility)
+        if pi is not None and need_pi is not None:
+            pi_emb = self.embed_pi(pi)
+            # normalization
+            pi_emb = pi_emb / np.sqrt(self.dim_model // 2)
+            not_need_pi = torch.logical_not(need_pi)
+            pi_emb[not_need_pi] = 0.
+            x = x + pi_emb
+        
         x = self.embedding_input2(x)
         return x
 

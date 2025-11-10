@@ -19,7 +19,7 @@ ckpt_name: None
 use_tensorboard: false
 use_wandb: true
 wandb_project: lingo-training
-ckpt_interval: 20
+ckpt_interval: 5
 
 exp_dir: ${oc.env:ROOT_DIR}/results/${exp_name}
 smpl_dir: ${oc.env:ROOT_DIR}/smpl_models

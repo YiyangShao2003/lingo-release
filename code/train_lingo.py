@@ -62,6 +62,7 @@ def train_ddp(rank, world_size, cfg):
     if cfg.use_tensorboard and rank == 0:
         writer = SummaryWriter(log_dir=os.path.join(cfg.exp_dir, 'tensorboard_logs'))
     
+    # Determine run ID and checkpoint directory for this run
     if cfg.use_wandb and rank == 0:
         # Try to resolve config, but fallback to unresolved if interpolation errors occur
         try:
@@ -83,6 +84,14 @@ def train_ddp(rank, world_size, cfg):
             config=wandb_config,
             dir=cfg.exp_dir
         )
+        run_id = wandb.run.name
+    else:
+        run_id = os.environ.get('CURRENT_TIME', 'unknown')
+    
+    # Create checkpoint directory for this run (fixed for entire training)
+    if rank == 0:
+        ckpt_folder = os.path.join(cfg.exp_dir, 'checkpoints', run_id)
+        os.makedirs(ckpt_folder, exist_ok=True)
 
     # Only show progress bar on rank 0
     pbar_epochs = tqdm(
@@ -123,18 +132,18 @@ def train_ddp(rank, world_size, cfg):
             optimizer.zero_grad()
 
             joints, mat, scene_flag, text_clip_embedding, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi, is_loco = batch
-            joints, mat, scene_flag, text_clip_embedding, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi, is_loco = joints.to(device), \
+            joints, mat, scene_flag, text_clip_embedding, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco = joints.to(device), \
                                                                                                         mat.to(device), scene_flag.to(device), \
                                                                                                         text_clip_embedding.to(device), \
                                                                                                         pelvis_goal.to(device), hand_goal.to(device), \
-                                                                                                        is_pick.to(device), need_scene.to(device), need_pelvis_dir.to(device), pi.to(device), \
-                                                                                                        need_pi.to(device), is_loco.to(device)
+                                                                                                        is_pick.to(device), need_scene.to(device), need_pelvis_dir.to(device), \
+                                                                                                        is_loco.to(device)
 
             t = torch.randint(0, trainer.timesteps, (cfg.batch_size,), device=device).long()
             with torch.no_grad():
                 mask, _, _ = get_mask(joints, -1, p=1., fixed_frame=cfg.auto_regre_num)
 
-            loss = trainer.p_losses(joints, mat, scene_flag, mask, t, text_clip_embedding, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi, is_loco)
+            loss = trainer.p_losses(joints, mat, scene_flag, mask, t, text_clip_embedding, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco)
 
             loss.backward()
             optimizer.step()
@@ -194,9 +203,8 @@ def train_ddp(rank, world_size, cfg):
 
         if rank == 0 and epoch % cfg.ckpt_interval == 0:
             tqdm.write(f'Saving checkpoint at epoch {epoch}')
-            ckpt_folder = os.path.join(cfg.exp_dir, 'checkpoints')
-            os.makedirs(ckpt_folder, exist_ok=True)
-            torch.save(model.module.state_dict(), os.path.join(ckpt_folder, f"{cfg.exp_name}_epoch{epoch:03d}.pth"))
+            ckpt_filename = f"{cfg.exp_name}_epoch{epoch:03d}.pth"
+            torch.save(model.module.state_dict(), os.path.join(ckpt_folder, ckpt_filename))
 
         torch.distributed.barrier()
 

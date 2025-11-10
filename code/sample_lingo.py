@@ -6,7 +6,6 @@ from omegaconf import DictConfig, OmegaConf
 from scipy.spatial.transform import Rotation as R
 from tqdm.auto import tqdm
 
-from models.synhsi import TimingModel
 from models.joints_to_smplx import joints_to_smpl
 from utils import *
 from constants import *
@@ -14,7 +13,7 @@ from clip_utils import get_clip_features
 from datasets.lingo import LingoDataset
 from astar import get_path
 
-def sample_step(cfg, step, mat, fixed_points, sampler, cond, trajectory, pi):
+def sample_step(cfg, step, mat, fixed_points, sampler, cond, trajectory):
     raw_text = cond['raw_text']
     text_emb = cond['text_emb']
     pelvis_goal = cond['pelvis_goal']
@@ -26,12 +25,9 @@ def sample_step(cfg, step, mat, fixed_points, sampler, cond, trajectory, pi):
     need_scene = cond['need_scene']
     need_pelvis_dir = cond['need_pelvis_dir']
     is_loco = cond['is_loco']
-    need_pi = cond['need_pi']
 
     speed_new = None
     if is_loco:
-        pi = torch.zeros((cfg.batch_size, ), dtype=torch.long).to(cfg.device)
-
         curr_loc = mat[0, :3, 3].cpu().numpy()
         curr_loc = np.array([curr_loc[0], curr_loc[2]]).reshape(1, 2)
 
@@ -75,16 +71,12 @@ def sample_step(cfg, step, mat, fixed_points, sampler, cond, trajectory, pi):
 
         pelvis_goal = pelvis_goal * speed_new
 
-    if not cfg.use_pi:
-        need_pi = torch.zeros((cfg.batch_size, ), dtype=torch.bool).to(cfg.device)
-        pi = torch.zeros((cfg.batch_size, ), dtype=torch.long).to(cfg.device)
-
-    print(f'pelvis_goal: {pelvis_goal}', 'pi: ', pi, 'need_pi: ', need_pi, 'need_scene: ', need_scene, 'need_pelvis_dir: ', need_pelvis_dir, 'raw_text: ', raw_text, 'speed: ', speed_new)
+    print(f'pelvis_goal: {pelvis_goal}', 'need_scene: ', need_scene, 'need_pelvis_dir: ', need_pelvis_dir, 'raw_text: ', raw_text, 'speed: ', speed_new)
 
     scene_flag = sampler.dataset.scene_dict[cond['scene_name']]
     scene_flag = torch.tensor([scene_flag]*cfg.batch_size).to(cfg.device)
 
-    samples, occs = sampler.p_sample_loop(fixed_points, mat, scene_flag, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi, is_loco)
+    samples, occs = sampler.p_sample_loop(fixed_points, mat, scene_flag, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco)
 
     points_gene = samples[-1]
     points_orig = transform_points(sampler.dataset.denormalize_torch(points_gene), mat)
@@ -92,8 +84,6 @@ def sample_step(cfg, step, mat, fixed_points, sampler, cond, trajectory, pi):
     info_dict = {
         'points_orig': points_orig.reshape(cfg.batch_size, cfg.max_window_size, 3*cfg.dataset.nb_joints),
         'pelvis_goal': transform_points(pelvis_goal, mat).reshape(cfg.batch_size, 3), # global coordinates
-        'pi': pi,
-        'need_pi': need_pi,
         'need_scene': need_scene,
         'need_pelvis_dir': need_pelvis_dir,
         'raw_text': raw_text,
@@ -156,7 +146,6 @@ def get_guidance(cfg, seg_id):
     cond['need_scene'] = need_scene
     cond['need_pelvis_dir'] = need_pelvis_dir
     cond['is_loco'] = torch.ones((cfg.batch_size, ), dtype=torch.bool).to(cfg.device) if 'walk' in cond['raw_text'] else torch.zeros((cfg.batch_size, ), dtype=torch.bool).to(cfg.device)
-    cond['need_pi'] = torch.zeros((cfg.batch_size, ), dtype=torch.bool).to(cfg.device) if 'walk' in cond['raw_text'] else torch.ones((cfg.batch_size, ), dtype=torch.bool).to(cfg.device)
 
     cond['start_location'] = input['start_location']
     cond['start_location'] = np.array([cond['start_location'][0], 0, cond['start_location'][2]])
@@ -184,17 +173,8 @@ def sample(cfg: DictConfig) -> None:
     sampler_body = hydra.utils.instantiate(cfg.sampler.pelvis)
     sampler_body.set_dataset_and_model(synhsi_dataset, model_body)
 
-    # load scheduler model
-    if cfg.use_scheduler:
-        scheduler_model = TimingModel(**cfg.model.scheduler)
-        scheduler_model.load_state_dict(torch.load(cfg.scheduler_model_path, map_location=device))
-        scheduler_model.to(device)
-        scheduler_model.eval()
-    else:
-        scheduler_model = None
 
     points_all = []
-    pi_list = []
     raw_text_list = []
 
     for seg_id in range(seg_num):
@@ -249,13 +229,9 @@ def sample(cfg: DictConfig) -> None:
                 fixed_points = points[:, -cfg.auto_regre_num:].reshape(cfg.batch_size, cfg.auto_regre_num, cfg.dataset.nb_joints*3)
                 fixed_points = sampler_body.dataset.normalize_torch(transform_points(fixed_points, torch.inverse(mat)))
 
-            phase = 1
-            speed_inter = 3
-            pi = torch.tensor([int((step + phase) * (cfg.max_window_size - cfg.auto_regre_num) * speed_inter)]).to(device=cfg.device, dtype=torch.long)
-            pi_list.append(pi.cpu().numpy())
             raw_text_list.append(cond['raw_text'])
 
-            info_dict = sample_step(cfg, step, mat, fixed_points, sampler_body, cond, trajectory, pi)
+            info_dict = sample_step(cfg, step, mat, fixed_points, sampler_body, cond, trajectory)
             points = info_dict['points_orig']  # points in global coordinates and is denormalized
 
             if step == seg_len - 1:
@@ -268,14 +244,6 @@ def sample(cfg: DictConfig) -> None:
                     points_all.append(points.cpu().numpy()[:, cfg.auto_regre_num:-cfg.auto_regre_num])
                 else:
                     points_all.append(points.cpu().numpy()[:, :-cfg.auto_regre_num])
-
-            # scheduler
-            if cfg.use_scheduler and not cond['is_loco']:
-                points_loco = sampler_body.dataset.normalize_torch(transform_points(points, torch.inverse(mat)))
-                stop_pred = scheduler_model(points_loco, cond['text_emb'], pi).squeeze(1)
-                stop_pred = torch.sigmoid(stop_pred)
-                if stop_pred > cfg.scheduler_threshold:                
-                    break
 
             if cond['is_loco'] and seg_id != seg_num - 1:
                 curr_loc = points[0, -1, :3].cpu().numpy().copy()
