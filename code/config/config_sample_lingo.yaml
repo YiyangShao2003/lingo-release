@@ -14,6 +14,8 @@ device: cuda
 batch_size: 1
 interp_s: 3
 
+mode: "t2m"
+
 locomotion_threshold: 1.0
 
 vis: true
@@ -21,14 +23,15 @@ start_type: stand
 
 repeat_time: 0
 seg_num: 1
-seg_len: 4 # episode
+seg_len: 4
 
 speed: 0.8
 
 test_setting: demo-21
 exp_dir: ${oc.env:ROOT_DIR}/results/outputs
 # ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_epoch040.pth
-ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_bs128_lr0.0001_ws16_occ_two_2025-11-09_21-39/test_epoch000.pth
+# ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_bs128_lr0.0001_ws16_occ_two_2025-11-10_02-21/test_epoch005.pth
+ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_bs128_lr0.0001_ws16_occ_two_2025-11-09_22-38/test_epoch010.pth
 # ckpt_path: ${oc.env:ROOT_DIR}/ckpts/model/bs128__ws16__scene_occ_two.pth
 input_path: ${oc.env:ROOT_DIR}/results/inputs/${test_setting}.pkl
 smpl_dir: ${oc.env:ROOT_DIR}/smpl_models
@@ -41,11 +44,11 @@ motion_len: 10000000
 
 load_language: true
 load_scene: true
-use_pi: true
+use_pi: false
 load_hand_goal: true
 load_pelvis_goal: true
 
-auto_regre_num: 2 # prefixed frames for each segment
+auto_regre_num: 2
 
 num_gpus: 1
 num_workers: 0

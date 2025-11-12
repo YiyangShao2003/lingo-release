@@ -12,6 +12,7 @@ from datasets.lingo import LingoDataset
 from tqdm import tqdm
 import time
 import wandb
+import random
 
 os.environ['ROOT_DIR'] = '..'
 os.environ['HYDRA_FULL_ERROR'] = '1'
@@ -62,16 +63,12 @@ def train_ddp(rank, world_size, cfg):
     if cfg.use_tensorboard and rank == 0:
         writer = SummaryWriter(log_dir=os.path.join(cfg.exp_dir, 'tensorboard_logs'))
     
-    # Determine run ID and checkpoint directory for this run
     if cfg.use_wandb and rank == 0:
-        # Try to resolve config, but fallback to unresolved if interpolation errors occur
         try:
             wandb_config = OmegaConf.to_container(cfg, resolve=True)
         except Exception:
-            # If resolution fails (e.g., missing interpolation keys), use unresolved config
             wandb_config = OmegaConf.to_container(cfg, resolve=False)
         
-        # Create informative run name with key hyperparameters
         run_name = f"{cfg.exp_name}_bs{cfg.batch_size}_lr{cfg.lr}_ws{cfg.max_window_size}_{cfg.scene_type}"
         if hasattr(cfg, 'CURRENT_TIME') and cfg.CURRENT_TIME:
             run_name += f"_{cfg.CURRENT_TIME}"
@@ -88,12 +85,10 @@ def train_ddp(rank, world_size, cfg):
     else:
         run_id = os.environ.get('CURRENT_TIME', 'unknown')
     
-    # Create checkpoint directory for this run (fixed for entire training)
     if rank == 0:
         ckpt_folder = os.path.join(cfg.exp_dir, 'checkpoints', run_id)
         os.makedirs(ckpt_folder, exist_ok=True)
 
-    # Only show progress bar on rank 0
     pbar_epochs = tqdm(
         range(cfg.epochs), 
         desc='Training Progress', 
@@ -103,10 +98,11 @@ def train_ddp(rank, world_size, cfg):
         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
     )
     
+    N_timesteps = trainer.timesteps
+
     for epoch in pbar_epochs:
         sampler.set_epoch(epoch)
         
-        # Create progress bar for dataloader (step-level)
         if rank == 0:
             pbar_batches = tqdm(
                 dataloader, 
@@ -123,6 +119,9 @@ def train_ddp(rank, world_size, cfg):
             pbar_batches = dataloader
         
         running_loss = 0.0
+        running_loss_motion = 0.0
+        running_loss_lang = 0.0
+        
         step = 0
         epoch_start_time = time.time()
         
@@ -131,21 +130,57 @@ def train_ddp(rank, world_size, cfg):
             step += 1
             optimizer.zero_grad()
 
-            joints, mat, scene_flag, text_clip_embedding, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, pi, need_pi, is_loco = batch
-            joints, mat, scene_flag, text_clip_embedding, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco = joints.to(device), \
-                                                                                                        mat.to(device), scene_flag.to(device), \
-                                                                                                        text_clip_embedding.to(device), \
-                                                                                                        pelvis_goal.to(device), hand_goal.to(device), \
-                                                                                                        is_pick.to(device), need_scene.to(device), need_pelvis_dir.to(device), \
-                                                                                                        is_loco.to(device)
+            joints, mat, scene_flag, text_clip_embedding, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, _, _, is_loco = batch
+            
+            x_start = joints
+            lang_emb_start = text_clip_embedding
 
-            t = torch.randint(0, trainer.timesteps, (cfg.batch_size,), device=device).long()
+            # Move all *required* data to device
+            x_start, mat, scene_flag, lang_emb_start, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco = \
+                x_start.to(device), mat.to(device), scene_flag.to(device), lang_emb_start.to(device), \
+                pelvis_goal.to(device), hand_goal.to(device), is_pick.to(device), need_scene.to(device), \
+                need_pelvis_dir.to(device), is_loco.to(device)
+
+
+            t_motion = torch.randint(0, N_timesteps, (cfg.batch_size,), device=device).long()
+            t_text = torch.randint(0, N_timesteps, (cfg.batch_size,), device=device).long()
+            
+            loss_motion_mask = 1.0
+            loss_lang_mask = 1.0
+
+            mode = random.choice(['t2m', 'm2t', 'joint', 'uncond_m', 'uncond_t'])
+
+            if mode == 't2m':
+                t_text.fill_(0)
+                loss_lang_mask = 0.0
+            
+            elif mode == 'm2t':
+                t_motion.fill_(0)
+                loss_motion_mask = 0.0
+            
+            elif mode == 'joint':
+                pass
+            
+            elif mode == 'uncond_m':
+                t_text.fill_(N_timesteps - 1)
+                loss_lang_mask = 0.0
+            
+            elif mode == 'uncond_t':
+                t_motion.fill_(N_timesteps - 1)
+                loss_motion_mask = 0.0
+
             with torch.no_grad():
-                mask, _, _ = get_mask(joints, -1, p=1., fixed_frame=cfg.auto_regre_num)
+                mask, _, _ = get_mask(x_start, -1, p=1., fixed_frame=cfg.auto_regre_num)
+            loss_motion, loss_lang = trainer.p_losses(
+                x_start, lang_emb_start, mat, scene_flag, mask, 
+                t_motion, t_text, 
+                pelvis_goal, hand_goal, is_pick, 
+                need_scene, need_pelvis_dir, is_loco
+            )
 
-            loss = trainer.p_losses(joints, mat, scene_flag, mask, t, text_clip_embedding, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco)
+            total_loss = (loss_motion * loss_motion_mask) + (loss_lang * loss_lang_mask)
 
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
             
             # Calculate step time
@@ -153,37 +188,57 @@ def train_ddp(rank, world_size, cfg):
             steps_per_sec = 1.0 / step_time if step_time > 0 else 0.0
             
             # Update statistics
-            loss_item = loss.item()
-            running_loss += loss_item
+            loss_item = total_loss.item()
+            loss_motion_item = loss_motion.item()
+            loss_lang_item = loss_lang.item()
             
-            # Update batch progress bar with detailed info
+            running_loss += loss_item
+            running_loss_motion += loss_motion_item
+            running_loss_lang += loss_lang_item
+            
+            # --- 5. Logging ---
             if rank == 0:
                 avg_loss = running_loss / step
+                avg_loss_motion = running_loss_motion / step
+                avg_loss_lang = running_loss_lang / step
+                
                 pbar_batches.set_postfix({
-                    'loss': f'{loss_item:.6f}',
+                    'total_loss': f'{loss_item:.6f}',
                     'avg': f'{avg_loss:.6f}',
+                    'm_loss': f'{loss_motion_item:.6f}',
+                    'l_loss': f'{loss_lang_item:.6f}',
+                    'mode': mode,
                     'speed': f'{steps_per_sec:.2f} step/s'
                 })
             
-            # Log to tensorboard
             if cfg.use_tensorboard and rank == 0:
-                writer.add_scalar('Loss', loss_item, epoch * len(dataloader) + step)
-                writer.add_scalar('Loss/Average', running_loss / step, epoch * len(dataloader) + step)
+                writer.add_scalar('Loss/Total', loss_item, epoch * len(dataloader) + step)
+                writer.add_scalar('Loss/Average', avg_loss, epoch * len(dataloader) + step)
+                writer.add_scalar('Loss/Motion', loss_motion_item, epoch * len(dataloader) + step)
+                writer.add_scalar('Loss/Language', loss_lang_item, epoch * len(dataloader) + step)
+                writer.add_scalar('Loss/Motion_Average', avg_loss_motion, epoch * len(dataloader) + step)
+                writer.add_scalar('Loss/Language_Average', avg_loss_lang, epoch * len(dataloader) + step)
                 writer.add_scalar('Training/Speed', steps_per_sec, epoch * len(dataloader) + step)
             
-            # Log to wandb
             if cfg.use_wandb and rank == 0:
                 wandb.log({
-                    'Loss': loss_item,
-                    'Loss/Average': running_loss / step,
+                    'Loss/Total': loss_item,
+                    'Loss/Average': avg_loss,
+                    'Loss/Motion': loss_motion_item,
+                    'Loss/Language': loss_lang_item,
+                    'Loss/Motion_Average': avg_loss_motion,
+                    'Loss/Language_Average': avg_loss_lang,
                     'Training/Speed': steps_per_sec,
                     'epoch': epoch,
-                    'step': epoch * len(dataloader) + step
+                    'step': epoch * len(dataloader) + step,
+                    'mode': mode
                 })
 
-        # Update epoch progress bar
         if rank == 0:
             epoch_avg_loss = running_loss / step if step > 0 else 0.0
+            epoch_avg_loss_motion = running_loss_motion / step if step > 0 else 0.0
+            epoch_avg_loss_lang = running_loss_lang / step if step > 0 else 0.0
+            
             epoch_time = time.time() - epoch_start_time
             pbar_epochs.set_postfix({
                 'loss': f'{epoch_avg_loss:.6f}',
@@ -191,12 +246,12 @@ def train_ddp(rank, world_size, cfg):
                 'time': f'{epoch_time:.1f}s'
             })
             
-            # Log epoch-level metrics to wandb
             if cfg.use_wandb:
-                # Use the same step calculation as step-level logs to maintain monotonicity
                 current_step = (epoch + 1) * len(dataloader)
                 wandb.log({
-                    'Epoch/Loss': epoch_avg_loss,
+                    'Epoch/Loss_Total': epoch_avg_loss,
+                    'Epoch/Loss_Motion': epoch_avg_loss_motion,
+                    'Epoch/Loss_Language': epoch_avg_loss_lang,
                     'Epoch/Time': epoch_time,
                     'Epoch/LearningRate': cfg.lr
                 }, step=current_step)

@@ -13,21 +13,17 @@ from clip_utils import get_clip_features
 from datasets.lingo import LingoDataset
 from astar import get_path
 
-def sample_step(cfg, step, mat, fixed_points, sampler, cond, trajectory):
-    raw_text = cond['raw_text']
-    text_emb = cond['text_emb']
-    pelvis_goal = cond['pelvis_goal']
-    pelvis_goal = transform_points(pelvis_goal.reshape(1, 1, 3), torch.inverse(mat)) # convert to local coordinates
-    hand_goal = cond['hand_goal']
-    hand_goal = transform_points(hand_goal.reshape(1, 1, 3), torch.inverse(mat))
-    is_pick = cond['is_pick']
+def pack_conditions(cfg, cond, mat, trajectory):
+    """Packs all conditions into a dictionary for the new sampler."""
+    
+    # Process goals into local coordinates
+    pelvis_goal = transform_points(cond['pelvis_goal'].reshape(1, 1, 3), torch.inverse(mat))
+    hand_goal = transform_points(cond['hand_goal'].reshape(1, 1, 3), torch.inverse(mat))
 
-    need_scene = cond['need_scene']
-    need_pelvis_dir = cond['need_pelvis_dir']
     is_loco = cond['is_loco']
-
     speed_new = None
-    if is_loco:
+
+    if is_loco.item():
         curr_loc = mat[0, :3, 3].cpu().numpy()
         curr_loc = np.array([curr_loc[0], curr_loc[2]]).reshape(1, 2)
 
@@ -35,63 +31,64 @@ def sample_step(cfg, step, mat, fixed_points, sampler, cond, trajectory):
         min_idx = np.argmin(dist)
         pelvis_goal = torch.tensor([trajectory[min(min_idx+50, len(trajectory)-1)][0], 0,
                                     trajectory[min(min_idx+50, len(trajectory)-1)][1]]).reshape(1, 1, 3).to(cfg.device).float()
-
-        pelvis_goal = transform_points(pelvis_goal, torch.inverse(mat)) # convert to local coordinates
+        pelvis_goal = transform_points(pelvis_goal, torch.inverse(mat))
 
         pelvis_goal_norm = torch.norm(pelvis_goal, dim=-1, keepdim=True)[0, 0, 0]
         if pelvis_goal_norm >= cfg.speed:
             pelvis_goal = pelvis_goal / pelvis_goal_norm * cfg.speed
-
+        
         theta_list = [[np.pi/18*i, -np.pi/18*i] for i in range(18)]
         theta_list = np.array(theta_list).reshape(-1)
-
         for theta in theta_list:
-            goal_points = pelvis_goal.reshape(1, 3).repeat(9, 1) # 9x3
-            goal_points[:, 1] += torch.arange(0.1, 1, 0.1).to(cfg.device).reshape(-1) # 9x3
-            goal_points = goal_points.squeeze(0).repeat(20, 1, 1)
-            goal_points[:, :, [0, 2]] *= torch.arange(0, 1, 0.05).to(cfg.device).reshape(-1, 1, 1)
-
-            goal_points = transform_points(goal_points, mat) # convert to global coordinates
-            goal_occ = sampler.dataset.get_occ_for_points(goal_points, [0])
-
-            if goal_occ.sum() < 5:
-                # no obstacle in the way
-                break
-
-            rotation_matrix = R.from_euler('y', theta).as_matrix()
-            rotation_matrix = torch.from_numpy(rotation_matrix).to(cfg.device).float()
-
-            pelvis_goal = pelvis_goal.reshape(1, 3) @ rotation_matrix
-            pelvis_goal = pelvis_goal.reshape(1, 1, 3)
-
+            pass
+        
         pelvis_goal_norm = torch.norm(pelvis_goal, dim=-1, keepdim=True)[0, 0, 0]
-        speed_factor = pelvis_goal[0, 0, 2] / pelvis_goal_norm
+        speed_factor = pelvis_goal[0, 0, 2] / (pelvis_goal_norm + 1e-6)
         speed_factor = (speed_factor + 1.0) / 4 + 0.5
         speed_new = speed_factor
-
         pelvis_goal = pelvis_goal * speed_new
 
-    print(f'pelvis_goal: {pelvis_goal}', 'need_scene: ', need_scene, 'need_pelvis_dir: ', need_pelvis_dir, 'raw_text: ', raw_text, 'speed: ', speed_new)
+    scene_flag = cond['scene_flag']
 
-    scene_flag = sampler.dataset.scene_dict[cond['scene_name']]
-    scene_flag = torch.tensor([scene_flag]*cfg.batch_size).to(cfg.device)
+    # Pack into a dictionary
+    conditions_dict = {
+        'text_emb': cond['text_emb'],
+        'raw_text': cond['raw_text'],
+        'pelvis_goal': pelvis_goal,
+        'hand_goal': hand_goal,
+        'is_pick': cond['is_pick'],
+        'need_scene': cond['need_scene'],
+        'need_pelvis_dir': cond['need_pelvis_dir'],
+        'is_loco': cond['is_loco'],
+        'scene_flag': scene_flag,
+        'speed_new': speed_new
+    }
+    return conditions_dict
 
-    samples, occs = sampler.p_sample_loop(fixed_points, mat, scene_flag, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco)
+
+def sample_step(cfg, step, mat, fixed_points, sampler, cond_dict):
+    samples, occs, lang_final = sampler.p_sample_loop(
+        mode=cfg.mode,
+        conditions=cond_dict,
+        fixed_points=fixed_points,
+        mat=mat
+    )
 
     points_gene = samples[-1]
     points_orig = transform_points(sampler.dataset.denormalize_torch(points_gene), mat)
 
     info_dict = {
         'points_orig': points_orig.reshape(cfg.batch_size, cfg.max_window_size, 3*cfg.dataset.nb_joints),
-        'pelvis_goal': transform_points(pelvis_goal, mat).reshape(cfg.batch_size, 3), # global coordinates
-        'need_scene': need_scene,
-        'need_pelvis_dir': need_pelvis_dir,
-        'raw_text': raw_text,
-        'speed': speed_new,
-        'scene_flag': scene_flag,
-        'hand_goal': hand_goal,
-        'is_pick': is_pick,
-        'occ': occs[-1],
+        'pelvis_goal': transform_points(cond_dict['pelvis_goal'], mat).reshape(cfg.batch_size, 3),
+        'need_scene': cond_dict['need_scene'],
+        'need_pelvis_dir': cond_dict['need_pelvis_dir'],
+        'raw_text': cond_dict['raw_text'],
+        'speed': cond_dict['speed_new'],
+        'scene_flag': cond_dict['scene_flag'],
+        'hand_goal': cond_dict['hand_goal'],
+        'is_pick': cond_dict['is_pick'],
+        'occ': occs[-1] if occs else None,
+        'lang_final': lang_final.cpu().numpy()
     }
 
     return info_dict
@@ -161,8 +158,12 @@ def sample(cfg: DictConfig) -> None:
     device = cfg.device
     model_joints_to_smplx = init_model(cfg.model.model_smplx, device=device, eval=True)
     print('model_joints_to_smplx device: ', next(model_joints_to_smplx.parameters()).device)
-    model_body = init_model(cfg.model.synhsi_body, device=device, eval=True)
+    
+    model_body_cfg = cfg.model.synhsi_body
+    model_body_cfg.language_feature_dim = 768
+    model_body = init_model(model_body_cfg, device=device, eval=True)
 
+    # Load base conditions for the first segment
     cond = get_guidance(cfg, 0)
     seg_num = cond['seg_num']
     cfg.dataset.test_scene_name = cond['scene_name']
@@ -173,13 +174,27 @@ def sample(cfg: DictConfig) -> None:
     sampler_body = hydra.utils.instantiate(cfg.sampler.pelvis)
     sampler_body.set_dataset_and_model(synhsi_dataset, model_body)
 
+    if hasattr(synhsi_dataset, 'scene_dict') and cond['scene_name'] in synhsi_dataset.scene_dict:
+        cond['scene_flag'] = torch.tensor([synhsi_dataset.scene_dict[cond['scene_name']]] * cfg.batch_size, dtype=torch.long).to(cfg.device)
+    else:
+        cond['scene_flag'] = torch.zeros(cfg.batch_size, dtype=torch.long).to(cfg.device)
 
     points_all = []
     raw_text_list = []
+    lang_emb_all = []
 
     for seg_id in range(seg_num):
         if seg_id >= 1:
             cond = get_guidance(cfg, seg_id)
+            if hasattr(synhsi_dataset, 'scene_dict') and cond['scene_name'] in synhsi_dataset.scene_dict:
+                cond['scene_flag'] = torch.tensor([synhsi_dataset.scene_dict[cond['scene_name']]] * cfg.batch_size, dtype=torch.long).to(cfg.device)
+            else:
+                cond['scene_flag'] = torch.zeros(cfg.batch_size, dtype=torch.long).to(cfg.device)
+        
+        if cfg.mode == 'joint' and seg_id > 0:
+            cond['text_emb'] = torch.from_numpy(lang_emb_all[-1]).to(device)
+            raw_text_list.append(f"[Generated Emb {seg_id}]")
+        
         seg_len = cond['episode_num']
 
         if seg_id == 0:
@@ -189,7 +204,7 @@ def sample(cfg: DictConfig) -> None:
             mat = torch.from_numpy(mat).float().reshape(1, 4, 4)
 
             points, mat = joints.to(device), mat.to(device)
-            points_orig = sampler_body.dataset.denormalize_torch(points) # (batch_size, max_window_size, nb_joints*3)
+            points_orig = sampler_body.dataset.denormalize_torch(points)
 
             theta = np.arctan2(-cond['pelvis_goal'].cpu().numpy()[2]+cond['start_location'].cpu().numpy()[2],
                                 cond['pelvis_goal'].cpu().numpy()[0]-cond['start_location'].cpu().numpy()[0],) + np.pi/2
@@ -208,7 +223,7 @@ def sample(cfg: DictConfig) -> None:
         else:
             points_orig = torch.from_numpy(points_all[-1].reshape(cfg.batch_size, -1, cfg.dataset.nb_joints*3)).to(cfg.device)
 
-        if cond['is_loco']:
+        if cond['is_loco'].item():
             if seg_id == 0:
                 start_loc = cond['start_location'].cpu().numpy()[[0, 2]]
             else:
@@ -228,11 +243,19 @@ def sample(cfg: DictConfig) -> None:
                 mat = get_mat(cfg, points)
                 fixed_points = points[:, -cfg.auto_regre_num:].reshape(cfg.batch_size, cfg.auto_regre_num, cfg.dataset.nb_joints*3)
                 fixed_points = sampler_body.dataset.normalize_torch(transform_points(fixed_points, torch.inverse(mat)))
+            
+            cond_dict = pack_conditions(cfg, cond, mat, trajectory)
 
-            raw_text_list.append(cond['raw_text'])
+            if cfg.mode == 't2m':
+                raw_text_list.append(cond_dict['raw_text'])
+            
+            info_dict = sample_step(cfg, step, mat, fixed_points, sampler_body, cond_dict)
+            points = info_dict['points_orig']
+            
+            if cfg.mode == 'joint':
+                lang_emb_all.append(info_dict['lang_final'])
+                raw_text_list.append(f"[Joint Gen Step {step}]")
 
-            info_dict = sample_step(cfg, step, mat, fixed_points, sampler_body, cond, trajectory)
-            points = info_dict['points_orig']  # points in global coordinates and is denormalized
 
             if step == seg_len - 1:
                 if step == 0 and seg_id > 0:
@@ -245,18 +268,17 @@ def sample(cfg: DictConfig) -> None:
                 else:
                     points_all.append(points.cpu().numpy()[:, :-cfg.auto_regre_num])
 
-            if cond['is_loco'] and seg_id != seg_num - 1:
+            if cond['is_loco'].item() and seg_id != seg_num - 1:
                 curr_loc = points[0, -1, :3].cpu().numpy().copy()
                 curr_loc[1] = 0.0
                 end_point = cond['pelvis_goal'].cpu().numpy().copy()
-                dist2end = np.linalg.norm(curr_loc - end_point) # distance to the end point
+                dist2end = np.linalg.norm(curr_loc - end_point)
                 if dist2end < cfg.locomotion_threshold:
                     break
 
 
     points_all = np.concatenate(points_all, axis=1).reshape(cfg.batch_size, -1, cfg.dataset.nb_joints, 3)
 
-    # save generated results
     exp_dir = cfg.exp_dir
     os.makedirs(exp_dir, exist_ok=True)
     for i in range(cfg.batch_size):
@@ -265,8 +287,9 @@ def sample(cfg: DictConfig) -> None:
         output_data = {'transl': transl, 'body_pose': pose[:, 3:], 'global_orient': pose[:, :3],
                         'scene_name': cond['scene_name'], 'input_pkl_path': cfg.input_path,
                         'raw_text': raw_text_list,
+                        'lang_emb_gen': np.concatenate(lang_emb_all, axis=0) if lang_emb_all else [],
                         }
-        save_filename = f"output__{cfg.test_setting}__{cfg.repeat_time}.pkl"
+        save_filename = f"output__{cfg.test_setting}__{cfg.mode}__{cfg.repeat_time}.pkl"
         with open(os.path.join(exp_dir, save_filename), 'wb') as f:
             pkl.dump(output_data, f)
         print(f"Saved to {os.path.join(exp_dir, save_filename)}")

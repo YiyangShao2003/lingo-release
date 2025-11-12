@@ -8,6 +8,10 @@ defaults:
       - pelvis
   - _self_
 
+model:
+  synhsi_body:
+    language_feature_dim: 768
+
 exp_name: test
 train: true
 load_state_dict: false
@@ -34,7 +38,7 @@ start_type: stand
 
 load_language: true
 load_scene: true
-use_pi: true
+use_pi: false
 load_hand_goal: true
 load_pelvis_goal: true
 auto_regre_num: 2

@@ -1,6 +1,6 @@
 synhsi_body:
   _target_: models.synhsi.Unet
-  dim_model: 512
+  dim_model: 1024
   num_heads: 16
   num_layers: 8
   dropout_p: 0.1

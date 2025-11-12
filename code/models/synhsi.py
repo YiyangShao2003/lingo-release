@@ -56,14 +56,19 @@ class Sampler:
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
 
-    def p_losses(self, x_start, mat, scene_flag, mask, t, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco, noise=None, loss_type='huber'):
-        if noise is None:
-            noise = torch.randn_like(x_start)
+    def p_losses(self, x_start, lang_emb_start, mat, scene_flag, mask, t_motion, t_text, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco, loss_type='huber'):
+        
+        # 1. Create noise for both modalities
+        noise_motion = torch.randn_like(x_start)
+        noise_motion[mask] = 0.
+        
+        noise_lang = torch.randn_like(lang_emb_start)
 
-        noise[mask] = 0.
+        # 2. Create noisy versions
+        x_noisy = self.q_sample(x_start=x_start, t=t_motion, noise=noise_motion)
+        lang_noisy = self.q_sample(x_start=lang_emb_start, t=t_text, noise=noise_lang)
 
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-
+        # 3. Get scene conditions
         if self.dataset.load_scene:
             with torch.no_grad():
                 x_orig = transform_points(self.dataset.denormalize_torch(x_noisy), mat)
@@ -109,64 +114,123 @@ class Sampler:
                     occ = occ.permute(0, 2, 1, 3)
                     occ_goal = occ_goal.permute(0, 2, 1, 3)
                     occ = torch.cat([occ, occ_goal], dim=1)
-
         else:
             occ = None
 
-        predicted_noise = self.model(x_noisy, occ, t, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir)
+        # 4. Get model predictions
+        pred_motion_noise, pred_lang_noise = self.model(
+            x_noisy, lang_noisy, occ, 
+            t_motion, t_text, 
+            pelvis_goal, hand_goal, is_pick, 
+            need_scene, need_pelvis_dir
+        )
 
+        # 5. Calculate losses
         mask_inv = torch.logical_not(mask)
 
         if loss_type == 'l1':
-            loss = F.l1_loss(noise[mask_inv], predicted_noise[mask_inv])
+            loss_motion = F.l1_loss(noise_motion[mask_inv], pred_motion_noise[mask_inv])
+            loss_lang = F.l1_loss(noise_lang, pred_lang_noise)
         elif loss_type == 'l2':
-            loss = F.mse_loss(noise[mask_inv], predicted_noise[mask_inv])
+            loss_motion = F.mse_loss(noise_motion[mask_inv], pred_motion_noise[mask_inv])
+            loss_lang = F.mse_loss(noise_lang, pred_lang_noise)
         elif loss_type == "huber":
-            loss = F.smooth_l1_loss(noise[mask_inv], predicted_noise[mask_inv])
+            loss_motion = F.smooth_l1_loss(noise_motion[mask_inv], pred_motion_noise[mask_inv])
+            loss_lang = F.smooth_l1_loss(noise_lang, pred_lang_noise)
         else:
             raise NotImplementedError()
 
-        return loss
+        return loss_motion, loss_lang
 
     @torch.no_grad()
-    def p_sample_loop(self, fixed_points, mat, scene_flag, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco):
+    def p_sample_loop(self, mode, conditions, fixed_points, mat):
+        """
+        New sampling loop that supports different modes.
+        
+        :param mode: str, 't2m', 'm2t', 'joint'
+        :param conditions: dict, contains all necessary clean conditions
+        :param fixed_points: tensor, for auto-regression
+        :param mat: tensor, for coordinate transformation
+        """
         device = next(self.model.parameters()).device
         shape = (self.batch_size, self.dataset.max_window_size, self.channel)
-        points = torch.randn(shape, device=device)
+        
+        noisy_motion = torch.randn(shape, device=device)
+        
+        lang_shape = (self.batch_size, 1, self.model.out_lang.out_features) # (B, 1, D_lang)
+        noisy_lang = torch.randn(lang_shape, device=device)
 
+        # 2. Set timesteps based on mode
+        if mode == 't2m':
+            t_text_val = 0 # Language is clean
+            # We only need to denoise motion
+            loop_timesteps = reversed(range(0, self.timesteps))
+        elif mode == 'joint':
+            t_text_val = -1 # Use same timestep as motion
+            loop_timesteps = reversed(range(0, self.timesteps))
+        else:
+            # m2t (motion-to-text) and unconditional modes
+            # would require different logic here.
+            # For this example, we'll focus on t2m and joint.
+            raise NotImplementedError(f"Mode {mode} not implemented for sampling.")
+
+        # 3. Apply auto-regressive fixed points
         if self.auto_regre_num > 0:
-            self.set_fixed_points(points, None, fixed_points, mat, joint_id=self.mask_ind, fix_mode=True, fix_goal=False)
+            self.set_fixed_points(noisy_motion, None, fixed_points, mat, joint_id=self.mask_ind, fix_mode=True, fix_goal=False)
+
+        # Store intermediate results
         imgs = []
         occs = []
-        for i in tqdm(reversed(range(0, self.timesteps)), desc='sampling loop time step', total=self.timesteps):
-            model_used = self.model
+        
+        # 4. Run the diffusion loop
+        for i in tqdm(loop_timesteps, desc=f'sampling loop ({mode})', total=self.timesteps):
+            t_motion = torch.full((self.batch_size,), i, device=device, dtype=torch.long)
+            
+            if t_text_val == 0:
+                t_text = torch.full((self.batch_size,), 0, device=device, dtype=torch.long)
+                lang_payload = conditions['text_emb']
+            else:
+                t_text = t_motion.clone()
+                lang_payload = noisy_lang
 
-            points, occ = self.p_sample(model_used, points, fixed_points, mat, scene_flag,
-                                        torch.full((self.batch_size,), i, device=device, dtype=torch.long), i,
-                                        text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco
-                                        )
+            # Get denoised predictions for one step
+            noisy_motion, noisy_lang, occ = self.p_sample(
+                mode, noisy_motion, lang_payload, mat, t_motion, t_text, conditions
+            )
+            
             if self.auto_regre_num > 0:
-                self.set_fixed_points(points, None, fixed_points, mat, joint_id=self.mask_ind, fix_mode=True, fix_goal=False)
+                self.set_fixed_points(noisy_motion, None, fixed_points, mat, joint_id=self.mask_ind, fix_mode=True, fix_goal=False)
 
-            points_orig = points
-
-            imgs.append(points_orig)
+            imgs.append(noisy_motion)
             if occ is not None:
                 occs.append(occ.cpu().numpy())
 
-        return imgs, occs
+        return imgs, occs, noisy_lang
 
     @torch.no_grad()
-    def p_sample(self, model, x, fixed_points, mat, scene_flag, t, t_index,
-                 text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir, is_loco):
-        betas_t = extract(self.betas, t, x.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(
-            self.sqrt_one_minus_alphas_cumprod, t, x.shape
-        )
-        sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, x.shape)
+    def p_sample(self, mode, x_motion, x_lang, mat, t_motion, t_text, conditions):
+        
+        # 1. Extract conditions
+        scene_flag = conditions['scene_flag']
+        pelvis_goal = conditions['pelvis_goal']
+        hand_goal = conditions['hand_goal']
+        is_pick = conditions['is_pick']
+        need_scene = conditions['need_scene']
+        need_pelvis_dir = conditions['need_pelvis_dir']
+        is_loco = conditions.get('is_loco', torch.zeros_like(need_pelvis_dir))
+        
+        # 2. Get betas and alphas for denoising
+        betas_t_motion = extract(self.betas, t_motion, x_motion.shape)
+        sqrt_one_minus_alphas_cumprod_t_motion = extract(self.sqrt_one_minus_alphas_cumprod, t_motion, x_motion.shape)
+        sqrt_recip_alphas_t_motion = extract(self.sqrt_recip_alphas, t_motion, x_motion.shape)
+        
+        betas_t_lang = extract(self.betas, t_text, x_lang.shape)
+        sqrt_one_minus_alphas_cumprod_t_lang = extract(self.sqrt_one_minus_alphas_cumprod, t_text, x_lang.shape)
+        sqrt_recip_alphas_t_lang = extract(self.sqrt_recip_alphas, t_text, x_lang.shape)
 
+        # 3. Get scene occupancy grid
         if self.dataset.load_scene:
-            x_orig = transform_points(self.dataset.denormalize_torch(x), mat)
+            x_orig = transform_points(self.dataset.denormalize_torch(x_motion), mat)
             mat_for_query = mat.clone()
             target_ind = self.mask_ind if self.mask_ind != -1 else 0
             mat_for_query[:, :3, 3] = x_orig[:, self.emb_f, target_ind * 3: target_ind * 3 + 3]
@@ -195,37 +259,46 @@ class Sampler:
 
             if self.scene_type == 'occ':
                 occ = occ.permute(0, 2, 1, 3)
-            elif self.scene_type == 'plane':
-                occ = occ.permute(0, 1, 3, 2)
-                occ_cnt = occ * self.occ_idx
-                occ = torch.argmax(occ_cnt, dim=-1).unsqueeze(1).float() / nb_voxels[1]
-            elif self.scene_type == 'plane_two':
-                occ = occ.permute(0, 1, 3, 2)
-                occ_cnt = occ * self.occ_idx
-                occ = torch.argmax(occ_cnt, dim=-1).unsqueeze(1).float() / nb_voxels[1]
-
-                occ_goal = occ_goal.permute(0, 1, 3, 2)
-                occ_goal_cnt = occ_goal * self.occ_idx
-                occ_goal = torch.argmax(occ_goal_cnt, dim=-1).unsqueeze(1).float() / nb_voxels[1]
-                occ = torch.cat([occ, occ_goal], dim=1)
             elif self.scene_type == 'occ_two':
                 occ = occ.permute(0, 2, 1, 3)
                 occ_goal = occ_goal.permute(0, 2, 1, 3)
                 occ = torch.cat([occ, occ_goal], dim=1)
-
         else:
             occ = None
 
-        model_mean = sqrt_recip_alphas_t * (
-                x - betas_t * model(x, occ, t, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir) / sqrt_one_minus_alphas_cumprod_t
+        # 4. Call the model
+        pred_motion_noise, pred_lang_noise = self.model(
+            x_motion, x_lang, occ, 
+            t_motion, t_text, 
+            pelvis_goal, hand_goal, is_pick, 
+            need_scene, need_pelvis_dir
         )
-
-        if t_index == 0:
-            return model_mean, occ
+        
+        # 5. Denoise based on mode
+        denoised_motion = sqrt_recip_alphas_t_motion * (
+                x_motion - betas_t_motion * pred_motion_noise / sqrt_one_minus_alphas_cumprod_t_motion
+        )
+        
+        if mode == 'joint':
+            denoised_lang = sqrt_recip_alphas_t_lang * (
+                    x_lang - betas_t_lang * pred_lang_noise / sqrt_one_minus_alphas_cumprod_t_lang
+            )
         else:
-            posterior_variance_t = extract(self.posterior_variance, t, x.shape)
-            return model_mean + torch.sqrt(posterior_variance_t) * torch.randn_like(x), occ
+            denoised_lang = x_lang
+            
+        # 6. Apply noise for next step (if not at t=0)
+        
+        final_denoised_motion = denoised_motion
+        if t_motion[0].item() != 0:
+            posterior_variance_t_motion = extract(self.posterior_variance, t_motion, x_motion.shape)
+            final_denoised_motion = denoised_motion + torch.sqrt(posterior_variance_t_motion) * torch.randn_like(x_motion)
 
+        final_denoised_lang = denoised_lang
+        if mode == 'joint' and t_text[0].item() != 0:
+            posterior_variance_t_lang = extract(self.posterior_variance, t_text, x_lang.shape)
+            final_denoised_lang = denoised_lang + torch.sqrt(posterior_variance_t_lang) * torch.randn_like(x_lang)
+
+        return final_denoised_motion, final_denoised_lang, occ
 
     def set_fixed_points(self, img, goal, fixed_points, mat, joint_id, fix_mode, fix_goal):
         '''
@@ -305,10 +378,9 @@ class Unet(nn.Module):
             dim_model=dim_model, dropout_p=dropout_p, max_len=5000
         )
         self.embedding_input = nn.Linear(dim_input, dim_model)
-        self.embedding_output = nn.Linear(dim_output, dim_model)
-
+        
         if self.load_language:
-            self.embedding_language = LanguageEncoder(dim_output=dim_model, dim_input=language_feature_dim)
+            self.embedding_language_input = nn.Linear(language_feature_dim, dim_model)
 
         if self.load_hand_goal:
             self.embedding_hand_goal = GoalEncoder(mode='hand', dim_output=dim_model)
@@ -328,59 +400,70 @@ class Unet(nn.Module):
 
         self.out = nn.Linear(dim_model, dim_output)
 
+        if self.load_language:
+            self.out_lang = nn.Linear(dim_model, language_feature_dim)
+
         self.embed_timestep = TimestepEmbedder(self.dim_model, self.positional_encoder)
+        
+        if self.load_language:
+            self.embed_timestep_lang = TimestepEmbedder(self.dim_model, self.positional_encoder)
 
-    def forward(self, x, cond, timesteps, text_emb, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir):
-        t_emb = self.embed_timestep(timesteps)  # [b, 1, d]
+    def forward(self, x_motion, noisy_lang_emb, cond, t_motion, t_text, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir):
+        t_motion_emb = self.embed_timestep(t_motion)
+        t_lang_emb = self.embed_timestep_lang(t_text)
 
+        # Embed Context Conditions
         if not self.load_scene:
-            scene_emb = torch.zeros_like(t_emb)
+            scene_emb = torch.zeros_like(t_motion_emb)
         else:
             scene_emb = self.scene_embedding(cond).reshape(-1, 1, self.dim_model)
             not_need_scene = torch.logical_not(need_scene)
             scene_emb[not_need_scene] = 0.
         
-        if not self.load_language:
-            language_emb = torch.zeros_like(t_emb)
-        else:
-            language_emb = self.embedding_language(text_emb)
-
         if not self.load_hand_goal:
-            hand_goal_emb = torch.zeros_like(t_emb)
+            hand_goal_emb = torch.zeros_like(t_motion_emb)
         else:
             hand_goal_emb = self.embedding_hand_goal(hand_goal)
             is_not_pick = torch.logical_not(is_pick)
             hand_goal_emb[is_not_pick] = 0.
 
         if not self.load_pelvis_goal:
-            pelvis_goal_emb = torch.zeros_like(t_emb)
+            pelvis_goal_emb = torch.zeros_like(t_motion_emb)
         else:
             pelvis_goal_emb = self.embedding_pelvis_goal(pelvis_goal)
             not_need_pelvis_dir = torch.logical_not(need_pelvis_dir)
             pelvis_goal_emb[not_need_pelvis_dir] = 0.
 
-        t_emb = t_emb.permute(1, 0, 2)
+        scene_emb = t_motion_emb + scene_emb
+        hand_goal_emb = t_motion_emb + hand_goal_emb
+        pelvis_goal_emb = t_motion_emb + pelvis_goal_emb
+        
         scene_emb = scene_emb.permute(1, 0, 2)
-        language_emb = language_emb.permute(1, 0, 2)
         hand_goal_emb = hand_goal_emb.permute(1, 0, 2)
         pelvis_goal_emb = pelvis_goal_emb.permute(1, 0, 2)
 
-        scene_emb = t_emb + scene_emb
-        language_emb = t_emb + language_emb
-        hand_goal_emb = t_emb + hand_goal_emb
-        pelvis_goal_emb = t_emb + pelvis_goal_emb
+        x_motion = x_motion.permute(1, 0, 2)
+        x_motion_tokens = self.embedding_input(x_motion) * math.sqrt(self.dim_model)
+        
+        lang_token = self.embedding_language_input(noisy_lang_emb) # (B, 1, D_model)
+        lang_token = lang_token + t_lang_emb
+        lang_token = lang_token.permute(1, 0, 2)
 
-        x = x.permute(1, 0, 2)
-        x = self.embedding_input(x) * math.sqrt(self.dim_model)
-
-        x = torch.cat((scene_emb, language_emb, hand_goal_emb, pelvis_goal_emb, x), dim=0)
+        x = torch.cat((scene_emb, hand_goal_emb, pelvis_goal_emb, lang_token, x_motion_tokens), dim=0)
+        
         x = self.positional_encoder(x)
         x = self.transformer(x)
 
-        output = self.out(x)[4:]
-        output = output.permute(1, 0, 2)
+        lang_output_token = x[3:4]
+        motion_output_tokens = x[4:]
+        
+        pred_motion_noise = self.out(motion_output_tokens)
+        pred_motion_noise = pred_motion_noise.permute(1, 0, 2) # (B, W, D_output)
 
-        return output
+        pred_lang_noise = self.out_lang(lang_output_token)
+        pred_lang_noise = pred_lang_noise.permute(1, 0, 2) # (B, 1, D_lang)
+
+        return pred_motion_noise, pred_lang_noise
 
 
 class PositionalEncoding(nn.Module):
@@ -457,7 +540,7 @@ class ActionTransformerEncoder(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=dim_model,
                                                     nhead=nhead,
                                                     dim_feedforward=dim_feedforward,
-                                                    dropout=dropout_p,
+                                                    dropout_p=dropout_p,
                                                     activation=activation)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer,
                                                  num_layers=num_layers
@@ -501,10 +584,8 @@ class LanguageEncoder(nn.Module):
 
         x = self.embedding_input1(x)
         
-        # Only add pi if provided (optional, for backward compatibility)
         if pi is not None and need_pi is not None:
             pi_emb = self.embed_pi(pi)
-            # normalization
             pi_emb = pi_emb / np.sqrt(self.dim_model // 2)
             not_need_pi = torch.logical_not(need_pi)
             pi_emb[not_need_pi] = 0.
