@@ -4,8 +4,11 @@ pelvis:
   mask_ind: ${guidance.pelvis.mask_ind}
   emb_f: ${guidance.pelvis.emb_f}
   batch_size: ${batch_size}
+  # channel: ${latent.dim}
   channel: ${times:${dataset.nb_joints},3}
   auto_regre_num: ${auto_regre_num}
   timesteps: 100
+  sampler_type: ${sampler_type}  # 'ddpm' or 'ddim'
+  ddim_steps: ${ddim_steps}  # Number of steps for DDIM (typically 10-50 when timesteps=100)
   motion_len: ${motion_len}
   scene_type: ${scene_type}

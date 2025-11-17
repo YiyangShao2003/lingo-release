@@ -7,6 +7,7 @@ from scipy.spatial.transform import Rotation as R
 from tqdm.auto import tqdm
 
 from models.joints_to_smplx import joints_to_smpl
+from models.latent_vae import load_motion_vae
 from utils import *
 from constants import *
 from clip_utils import get_clip_features
@@ -74,10 +75,12 @@ def sample_step(cfg, step, mat, fixed_points, sampler, cond_dict):
         mat=mat
     )
 
-    points_gene = samples[-1]
+    latents_final = samples[-1]
+    points_gene = sampler.decode_latent(latents_final)
     points_orig = transform_points(sampler.dataset.denormalize_torch(points_gene), mat)
 
     info_dict = {
+        'points_latent': latents_final,
         'points_orig': points_orig.reshape(cfg.batch_size, cfg.max_window_size, 3*cfg.dataset.nb_joints),
         'pelvis_goal': transform_points(cond_dict['pelvis_goal'], mat).reshape(cfg.batch_size, 3),
         'need_scene': cond_dict['need_scene'],
@@ -162,6 +165,12 @@ def sample(cfg: DictConfig) -> None:
     model_body_cfg = cfg.model.synhsi_body
     model_body_cfg.language_feature_dim = 768
     model_body = init_model(model_body_cfg, device=device, eval=True)
+    
+    # Only load VAE if using latent diffusion
+    use_latent = cfg.dataset.get('use_latent', False) or cfg.latent.get('use_cached', False)
+    vae_model = None
+    if use_latent:
+        vae_model = load_motion_vae(cfg.vae, device)
 
     # Load base conditions for the first segment
     cond = get_guidance(cfg, 0)
@@ -173,6 +182,8 @@ def sample(cfg: DictConfig) -> None:
 
     sampler_body = hydra.utils.instantiate(cfg.sampler.pelvis)
     sampler_body.set_dataset_and_model(synhsi_dataset, model_body)
+    if vae_model is not None:
+        sampler_body.attach_vae(vae_model)
 
     if hasattr(synhsi_dataset, 'scene_dict') and cond['scene_name'] in synhsi_dataset.scene_dict:
         cond['scene_flag'] = torch.tensor([synhsi_dataset.scene_dict[cond['scene_name']]] * cfg.batch_size, dtype=torch.long).to(cfg.device)
@@ -239,10 +250,12 @@ def sample(cfg: DictConfig) -> None:
                 mat = get_mat(cfg, points_orig)
                 fixed_points = points_orig[:, -cfg.auto_regre_num:].reshape(cfg.batch_size, cfg.auto_regre_num, cfg.dataset.nb_joints*3)
                 fixed_points = sampler_body.dataset.normalize_torch(transform_points(fixed_points, torch.inverse(mat)))
+                fixed_points = sampler_body.encode_motion(fixed_points)
             else:
                 mat = get_mat(cfg, points)
                 fixed_points = points[:, -cfg.auto_regre_num:].reshape(cfg.batch_size, cfg.auto_regre_num, cfg.dataset.nb_joints*3)
                 fixed_points = sampler_body.dataset.normalize_torch(transform_points(fixed_points, torch.inverse(mat)))
+                fixed_points = sampler_body.encode_motion(fixed_points)
             
             cond_dict = pack_conditions(cfg, cond, mat, trajectory)
 

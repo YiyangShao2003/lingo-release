@@ -1,0 +1,47 @@
+defaults:
+  - dataset: lingo
+  - _self_
+
+exp_name: vae_motion
+exp_dir: ${oc.env:ROOT_DIR}/results/${exp_name}
+device: cuda:0
+seed: 42
+batch_size: 1024
+lr: 0.001
+epochs: 200
+num_workers: 4
+beta_kl: 0.001
+
+use_wandb: true
+wandb_project: lingo-vae-training
+
+# Dataset/global flags required by dataset/lingo.yaml
+vis: false
+start_type: stand
+use_pi: false
+max_window_size: 16
+load_language: true
+load_scene: false
+load_hand_goal: false
+load_pelvis_goal: false
+
+latent:
+  dim: 64
+
+vae:
+  model:
+    _target_: models.latent_vae.MotionVAE
+    input_dim: ${times:${dataset.nb_joints},3}
+    latent_dim: ${latent.dim}
+    hidden_dim: 512
+    dropout_p: 0.1
+  ckpt_path: ${exp_dir}/checkpoints/vae_last.pth
+
+dataset:
+  train: true
+  load_language: true
+  load_scene: false
+  load_hand_goal: false
+  load_pelvis_goal: false
+  use_latent: false
+

@@ -31,7 +31,7 @@ test_setting: demo-21
 exp_dir: ${oc.env:ROOT_DIR}/results/outputs
 # ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_epoch040.pth
 # ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_bs128_lr0.0001_ws16_occ_two_2025-11-10_02-21/test_epoch005.pth
-ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_bs128_lr0.0001_ws16_occ_two_2025-11-09_22-38/test_epoch010.pth
+ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_bs128_lr0.0001_ws16_occ_two_2025-11-16_14-23/test_epoch010.pth
 # ckpt_path: ${oc.env:ROOT_DIR}/ckpts/model/bs128__ws16__scene_occ_two.pth
 input_path: ${oc.env:ROOT_DIR}/results/inputs/${test_setting}.pkl
 smpl_dir: ${oc.env:ROOT_DIR}/smpl_models
@@ -49,6 +49,25 @@ load_hand_goal: true
 load_pelvis_goal: true
 
 auto_regre_num: 2
+
+# Sampler settings (DDIM recommended for faster inference)
+sampler_type: ddim  # 'ddpm' or 'ddim' - use 'ddim' for faster sampling
+ddim_steps: 20  # Number of DDIM steps (10-50 typical, lower=faster but may reduce quality)
+
+latent:
+  dim: 64
+  use_cached: false
+  cache_root: ${oc.env:ROOT_DIR}/cache/latents
+  dtype: float16
+
+vae:
+  model:
+    _target_: models.latent_vae.MotionVAE
+    input_dim: ${times:${dataset.nb_joints},3}
+    latent_dim: ${latent.dim}
+    hidden_dim: 512
+    dropout_p: 0.1
+  ckpt_path: ${oc.env:ROOT_DIR}/results/vae_motion/checkpoints/vae_best.pth
 
 num_gpus: 1
 num_workers: 0

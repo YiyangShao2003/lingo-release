@@ -43,6 +43,28 @@ load_hand_goal: true
 load_pelvis_goal: true
 auto_regre_num: 2
 
+# Sampler settings (for training, DDPM is standard)
+sampler_type: ddpm  # 'ddpm' or 'ddim'
+ddim_steps: 20  # Only used if sampler_type='ddim'
+
+latent:
+  dim: 64
+  use_cached: false  # Set to false for vanilla diffusion
+  cache_root: ${oc.env:ROOT_DIR}/cache/latents
+  encode_batch_size: 128
+  cache_num_workers: 4
+  dtype: float16
+  cache_path: null
+
+vae:
+  model:
+    _target_: models.latent_vae.MotionVAE
+    input_dim: ${times:${dataset.nb_joints},3}
+    latent_dim: ${latent.dim}
+    hidden_dim: 512
+    dropout_p: 0.1
+  ckpt_path: ${oc.env:ROOT_DIR}/results/vae_motion/checkpoints/vae_best.pth
+
 ckpt_path: None
 
 hydra:

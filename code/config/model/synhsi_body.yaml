@@ -7,6 +7,10 @@ synhsi_body:
   nb_voxels: ${dataset.nb_voxels}
   free_p: 0.1
   ac_type: last_add_first_token
+  # For LATENT DIFFUSION: use ${latent.dim} (64)
+  # For VANILLA DIFFUSION: use ${times:${dataset.nb_joints},3} (84)
+  # dim_input: ${latent.dim}  # Change to ${times:${dataset.nb_joints},3} for vanilla diffusion
+  # dim_output: ${latent.dim}  # Change to ${times:${dataset.nb_joints},3} for vanilla diffusion
   dim_input: ${times:${dataset.nb_joints},3}
   dim_output: ${times:${dataset.nb_joints},3}
   scene_type: ${scene_type}

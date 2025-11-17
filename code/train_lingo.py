@@ -6,6 +6,7 @@ from torch.optim import Adam
 from utils import *
 from constants import *
 import os
+from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 import datetime
 from datasets.lingo import LingoDataset
@@ -13,6 +14,8 @@ from tqdm import tqdm
 import time
 import wandb
 import random
+from models.latent_vae import load_motion_vae
+from latent_utils import prepare_latent_cache
 
 os.environ['ROOT_DIR'] = '..'
 os.environ['HYDRA_FULL_ERROR'] = '1'
@@ -32,6 +35,13 @@ def train(cfg: DictConfig) -> None:
     os.environ["MASTER_PORT"] = find_free_port()
     world_size = cfg.num_gpus
     print('Usable GPUS: ', torch.cuda.device_count(), flush=True)
+    if hasattr(cfg, 'latent') and cfg.latent.use_cached:
+        cache_root = Path(cfg.latent.cache_root)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        current_time = os.environ.get('CURRENT_TIME', datetime.datetime.now().strftime('%Y-%m-%d_%H-%M'))
+        cache_name = f"{cfg.exp_name}_{current_time}_latents.npy"
+        cfg.latent.cache_path = str(cache_root / cache_name)
+
     torch.multiprocessing.spawn(train_ddp,
                                 args=(world_size, cfg),
                                 nprocs=world_size,
@@ -48,8 +58,27 @@ def train_ddp(rank, world_size, cfg):
     torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
 
     model = init_model(list(cfg.model.values())[0], device=rank, eval=False, load_state_dict=cfg.load_state_dict)
+    
+    # Only load VAE if using latent diffusion
+    use_latent = cfg.dataset.get('use_latent', False) or cfg.latent.get('use_cached', False)
+    vae = None
+    if use_latent:
+        vae = load_motion_vae(cfg.vae, device)
 
     synhsi_dataset = LingoDataset(**cfg.dataset)
+
+    if cfg.latent.use_cached and vae is not None:
+        if rank == 0:
+            prepare_latent_cache(
+                synhsi_dataset,
+                vae,
+                cfg.latent.cache_path,
+                cfg.latent.encode_batch_size,
+                torch.device(cfg.device),
+                cfg.latent.cache_num_workers
+            )
+        torch.distributed.barrier()
+        synhsi_dataset.attach_latent_cache(cfg.latent.cache_path, cfg.latent.dtype)
 
     sampler = DistributedSampler(synhsi_dataset)
     dataloader = DataLoader(synhsi_dataset, batch_size=cfg.batch_size, drop_last=True, num_workers=cfg.num_workers,
@@ -57,6 +86,8 @@ def train_ddp(rank, world_size, cfg):
 
     trainer = hydra.utils.instantiate(list(cfg.sampler.values())[0])
     trainer.set_dataset_and_model(synhsi_dataset, model)
+    if vae is not None:
+        trainer.attach_vae(vae)
 
     optimizer = Adam(model.parameters(), lr=cfg.lr)
 

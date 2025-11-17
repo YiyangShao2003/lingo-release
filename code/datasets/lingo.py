@@ -14,6 +14,10 @@ class LingoDataset(Dataset):
                  vis=True,
                  start_type='stand',
                  test_scene_name=None,
+                 use_latent=False,
+                 latent_cache_path=None,
+                 latent_dtype='float16',
+                 latent_dim=None,
                  **kwargs):
 
         self.folder = folder
@@ -28,6 +32,11 @@ class LingoDataset(Dataset):
         self.start_type = start_type
         self.test_scene_name = test_scene_name
         self.max_window_size = max_window_size
+        self.use_latent = use_latent
+        self.latent_cache_path = latent_cache_path
+        self.latent_dtype = latent_dtype
+        self.latent_dim = latent_dim
+        self.latent_cache = None
 
         self.global_orient = np.load(os.path.join(folder, 'human_orient.npy'))
         self.joints = np.load(os.path.join(folder, 'human_joints_aligned.npy'))
@@ -111,6 +120,9 @@ class LingoDataset(Dataset):
         self.min_torch = torch.tensor(self.min).to(device)
         self.max_torch = torch.tensor(self.max).to(device)
 
+        if self.use_latent and self.latent_cache_path is not None:
+            self.attach_latent_cache(self.latent_cache_path, self.latent_dtype)
+
     def __getitem__(self, idx):
         if self.load_language:
             start_idx = int(self.start_ind[idx])
@@ -191,7 +203,12 @@ class LingoDataset(Dataset):
             pi = 0
             need_pi = False
 
-        return joints.astype(np.float32), mat.astype(np.float32), scene_flag, \
+        if self.use_latent and self.latent_cache is not None:
+            joints_to_return = self.latent_cache[idx].astype(np.float32)
+        else:
+            joints_to_return = joints.astype(np.float32)
+
+        return joints_to_return, mat.astype(np.float32), scene_flag, \
                 text_clip_embedding, pelvis_goal.astype(np.float32), hand_goal.astype(np.float32), \
                 is_pick, need_scene, need_pelvis_dir, int(pi), need_pi, is_loco
 
@@ -241,6 +258,15 @@ class LingoDataset(Dataset):
         data = data.reshape(shape_orig)
 
         return data
+
+    def attach_latent_cache(self, cache_path, dtype='float16'):
+        self.latent_cache_path = cache_path
+        self.latent_cache = np.load(cache_path, mmap_mode='r')
+        if self.latent_cache.shape[0] != len(self):
+            raise ValueError(f"Latent cache length {self.latent_cache.shape[0]} "
+                             f"does not match dataset length {len(self)}")
+        self.latent_dim = self.latent_cache.shape[-1]
+        self.use_latent = True
 
     def normalize_torch(self, data):
         shape_orig = data.shape

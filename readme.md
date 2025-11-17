@@ -77,6 +77,8 @@ To run the code, you need to have the following installed:
     cd code
     python sample_lingo.py
     ```
+    
+    The sampler loads the latent VAE specified in `code/config/config_sample_lingo.yaml` (`vae.ckpt_path`). Make sure this path points to the checkpoint produced in the VAE training step (see below).
 
 3. **Visualization in Blender**:
 
@@ -113,6 +115,52 @@ python train_lingo.py
 ```
 
 The training script will automatically load the dataset, set up the model, and commence training sessions using the configurations in `./code/config` folder.
+
+## Latent Diffusion Pipeline
+
+Our training/inference pipeline now uses latent diffusion. Follow the steps below to prepare the latent autoencoder, cache latents, and run diffusion training or sampling.
+
+### Step 1. Train the Motion VAE
+
+```bash
+cd code
+python train_vae.py
+```
+
+- Configuration: `config/config_train_vae.yaml`
+- Outputs: checkpoints stored under `results/vae_motion/checkpoints/` (`vae_last.pth` and `vae_best.pth`)
+- You can customize latent dimensionality, hidden size, or KL weight by editing the config.
+
+### Step 2. Point Diffusion Configs to the VAE
+
+Both `config/config_train_lingo.yaml` and `config/config_sample_lingo.yaml` contain a `vae` block:
+
+```yaml
+vae:
+  model:
+    _target_: models.latent_vae.MotionVAE
+    input_dim: ${times:${dataset.nb_joints},3}
+    latent_dim: ${latent.dim}
+    hidden_dim: 512
+    dropout_p: 0.1
+  ckpt_path: ${oc.env:ROOT_DIR}/results/vae_motion/checkpoints/vae_last.pth
+```
+
+Update `ckpt_path` if you store the VAE elsewhere. The same path is used for both training and sampling.
+
+### Step 3. Run Diffusion Training with Cached Latents
+
+```bash
+python train_lingo.py
+```
+
+- On launch, rank 0 automatically encodes the entire dataset into latents using the VAE and writes a memmap cache under `${latent.cache_root}` (see `latent` block in `config_train_lingo.yaml`). The cache filename contains the experiment name and timestamp and is recreated for every training run.
+- Other ranks wait for the cache to finish, then stream latents directly, which shortens training and keeps motion preprocessing deterministic.
+- If you want to reuse an existing cache, set `latent.use_cached=false` to skip regeneration or manually point `latent.cache_path` to a precomputed file.
+
+### Step 4. Sampling with Latent Diffusion
+
+When `sample_lingo.py` runs, it loads the same VAE checkpoint, uses latent fixed points during auto-regression, and decodes final latents to joints before SMPL conversion. Ensure `config_sample_lingo.yaml` references the same `latent.dim` and `vae.ckpt_path` as the training config.
 
 
 # Citation

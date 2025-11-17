@@ -228,7 +228,7 @@ def init_model(model_cfg, device, eval, load_state_dict=False, need_ddp=True):
         model = model.to(device)
         if need_ddp:
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], broadcast_buffers=False,
-                                                              find_unused_parameters=True)
+                                                              find_unused_parameters=False)
         if load_state_dict:
             model.module.load_state_dict(torch.load(model_cfg.ckpt))
             model.train()

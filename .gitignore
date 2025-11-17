@@ -12,3 +12,6 @@ results/outputs/
 *.zip
 *.blend
 *.jpg
+cache/
+code/outputs/
+results/vae_motion/
