@@ -31,7 +31,7 @@ test_setting: demo-21
 exp_dir: ${oc.env:ROOT_DIR}/results/outputs
 # ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_epoch040.pth
 # ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_bs128_lr0.0001_ws16_occ_two_2025-11-10_02-21/test_epoch005.pth
-ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_bs128_lr0.0001_ws16_occ_two_2025-11-09_22-38/test_epoch010.pth
+ckpt_path: ${oc.env:ROOT_DIR}/results/test/checkpoints/test_bs128_lr0.0001_ws16_occ_two_2025-11-17_16-13/test_epoch050.pth
 # ckpt_path: ${oc.env:ROOT_DIR}/ckpts/model/bs128__ws16__scene_occ_two.pth
 input_path: ${oc.env:ROOT_DIR}/results/inputs/${test_setting}.pkl
 smpl_dir: ${oc.env:ROOT_DIR}/smpl_models

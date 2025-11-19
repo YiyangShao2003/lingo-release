@@ -7,6 +7,7 @@ from scipy.spatial.transform import Rotation as R
 from tqdm.auto import tqdm
 
 from models.joints_to_smplx import joints_to_smpl
+from models.lang_vae import LanguageVAE
 from utils import *
 from constants import *
 from clip_utils import get_clip_features
@@ -110,7 +111,7 @@ def get_mat(cfg, points):
     return mat
 
 
-def get_guidance(cfg, seg_id):
+def get_guidance(cfg, seg_id, lang_vae=None):
     cond = {}
 
     with open(cfg.input_path, 'rb') as f:
@@ -119,7 +120,18 @@ def get_guidance(cfg, seg_id):
 
     cond['scene_name'] = input['scene_name']
     cond['raw_text'] = input['text']
-    cond['text_emb'] = get_clip_features(input['text']).reshape(cfg.batch_size, 1, -1).to(cfg.device)
+
+    # Get CLIP embedding
+    clip_emb = get_clip_features(input['text']).reshape(cfg.batch_size, 1, -1).to(cfg.device)
+
+    # If a language VAE is provided (64D latent), encode CLIP to latent.
+    if getattr(cfg, "use_lang_vae", False) and lang_vae is not None:
+        with torch.no_grad():
+            latent = lang_vae.encode_to_latent(clip_emb)  # (B, 64)
+            cond['text_emb'] = latent.unsqueeze(1)        # (B, 1, 64)
+    else:
+        # Fall back to using raw CLIP features (B, 1, 768)
+        cond['text_emb'] = clip_emb
     cond['pelvis_goal'] = input['end_location']
     cond['pelvis_goal'] = np.array([cond['pelvis_goal'][0], 0, cond['pelvis_goal'][2]]) # set y to 0
     cond['pelvis_goal'] = torch.from_numpy(cond['pelvis_goal'].astype(np.float32)).to(cfg.device)
@@ -159,12 +171,28 @@ def sample(cfg: DictConfig) -> None:
     model_joints_to_smplx = init_model(cfg.model.model_smplx, device=device, eval=True)
     print('model_joints_to_smplx device: ', next(model_joints_to_smplx.parameters()).device)
     
+    # Optionally load language VAE for 64D latent text features
+    lang_vae = None
+    if getattr(cfg, "use_lang_vae", False) and getattr(cfg, "lang_vae_ckpt", None):
+        lang_vae = LanguageVAE(
+            input_dim=768,
+            latent_dim=64,
+            hidden_dim=256
+        ).to(device)
+        state = torch.load(cfg.lang_vae_ckpt, map_location=device)
+        lang_vae.load_state_dict(state)
+        lang_vae.eval()
+
     model_body_cfg = cfg.model.synhsi_body
-    model_body_cfg.language_feature_dim = 768
+    # Match language_feature_dim to how the diffusion model was trained
+    if lang_vae is not None:
+        model_body_cfg.language_feature_dim = 64
+    else:
+        model_body_cfg.language_feature_dim = 768
     model_body = init_model(model_body_cfg, device=device, eval=True)
 
     # Load base conditions for the first segment
-    cond = get_guidance(cfg, 0)
+    cond = get_guidance(cfg, 0, lang_vae=lang_vae)
     seg_num = cond['seg_num']
     cfg.dataset.test_scene_name = cond['scene_name']
     print(OmegaConf.to_yaml(cfg))
@@ -185,7 +213,7 @@ def sample(cfg: DictConfig) -> None:
 
     for seg_id in range(seg_num):
         if seg_id >= 1:
-            cond = get_guidance(cfg, seg_id)
+            cond = get_guidance(cfg, seg_id, lang_vae=lang_vae)
             if hasattr(synhsi_dataset, 'scene_dict') and cond['scene_name'] in synhsi_dataset.scene_dict:
                 cond['scene_flag'] = torch.tensor([synhsi_dataset.scene_dict[cond['scene_name']]] * cfg.batch_size, dtype=torch.long).to(cfg.device)
             else:
