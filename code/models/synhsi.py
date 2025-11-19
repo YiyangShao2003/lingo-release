@@ -409,17 +409,18 @@ class Unet(nn.Module):
             self.embed_timestep_lang = TimestepEmbedder(self.dim_model, self.positional_encoder)
 
     def forward(self, x_motion, noisy_lang_emb, cond, t_motion, t_text, pelvis_goal, hand_goal, is_pick, need_scene, need_pelvis_dir):
-        t_motion_emb = self.embed_timestep(t_motion)
-        t_lang_emb = self.embed_timestep_lang(t_text)
+        # 1. Timestep embeddings (kept as separate tokens)
+        t_motion_emb = self.embed_timestep(t_motion)          # (B, 1, D)
+        t_lang_emb = self.embed_timestep_lang(t_text)         # (B, 1, D)
 
-        # Embed Context Conditions
+        # 2. Embed context conditions (without adding timestep yet)
         if not self.load_scene:
             scene_emb = torch.zeros_like(t_motion_emb)
         else:
             scene_emb = self.scene_embedding(cond).reshape(-1, 1, self.dim_model)
             not_need_scene = torch.logical_not(need_scene)
             scene_emb[not_need_scene] = 0.
-        
+
         if not self.load_hand_goal:
             hand_goal_emb = torch.zeros_like(t_motion_emb)
         else:
@@ -434,28 +435,35 @@ class Unet(nn.Module):
             not_need_pelvis_dir = torch.logical_not(need_pelvis_dir)
             pelvis_goal_emb[not_need_pelvis_dir] = 0.
 
-        scene_emb = t_motion_emb + scene_emb
-        hand_goal_emb = t_motion_emb + hand_goal_emb
-        pelvis_goal_emb = t_motion_emb + pelvis_goal_emb
-        
-        scene_emb = scene_emb.permute(1, 0, 2)
-        hand_goal_emb = hand_goal_emb.permute(1, 0, 2)
-        pelvis_goal_emb = pelvis_goal_emb.permute(1, 0, 2)
+        # 3. Convert all embeddings to tokens (seq_len, batch, dim)
+        t_motion_tok = t_motion_emb.permute(1, 0, 2)
+        t_lang_tok = t_lang_emb.permute(1, 0, 2)
 
+        scene_tok = scene_emb.permute(1, 0, 2)
+        hand_goal_tok = hand_goal_emb.permute(1, 0, 2)
+        pelvis_goal_tok = pelvis_goal_emb.permute(1, 0, 2)
+
+        # 4. Motion and language tokens
         x_motion = x_motion.permute(1, 0, 2)
         x_motion_tokens = self.embedding_input(x_motion) * math.sqrt(self.dim_model)
-        
-        lang_token = self.embedding_language_input(noisy_lang_emb) # (B, 1, D_model)
-        lang_token = lang_token + t_lang_emb
+
+        lang_token = self.embedding_language_input(noisy_lang_emb)  # (B, 1, D_model)
         lang_token = lang_token.permute(1, 0, 2)
 
-        x = torch.cat((scene_emb, hand_goal_emb, pelvis_goal_emb, lang_token, x_motion_tokens), dim=0)
-        
+        # 5. Build final sequence:
+        # [t_motion, t_lang, scene, hand_goal, pelvis_goal, lang, motion_tokens]
+        x = torch.cat(
+            (t_motion_tok, t_lang_tok, scene_tok, hand_goal_tok, pelvis_goal_tok, lang_token, x_motion_tokens),
+            dim=0,
+        )
+
         x = self.positional_encoder(x)
         x = self.transformer(x)
 
-        lang_output_token = x[3:4]
-        motion_output_tokens = x[4:]
+        # Indices after concatenation:
+        # 0: t_motion, 1: t_lang, 2: scene, 3: hand_goal, 4: pelvis_goal, 5: lang, 6...: motion
+        lang_output_token = x[5:6]
+        motion_output_tokens = x[6:]
         
         pred_motion_noise = self.out(motion_output_tokens)
         pred_motion_noise = pred_motion_noise.permute(1, 0, 2) # (B, W, D_output)

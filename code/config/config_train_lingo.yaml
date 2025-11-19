@@ -10,7 +10,11 @@ defaults:
 
 model:
   synhsi_body:
-    language_feature_dim: 768
+    language_feature_dim: 768  # Will be set to 64 if use_lang_vae is true
+
+# Language VAE settings
+use_lang_vae: true
+lang_vae_ckpt: ${oc.env:ROOT_DIR}/results/lang_vae/checkpoints/lang_vae_bs128_lr0.0001_ld64_2025-11-17_16-08/best.pth
 
 exp_name: test
 train: true

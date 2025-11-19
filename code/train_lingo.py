@@ -13,6 +13,7 @@ from tqdm import tqdm
 import time
 import wandb
 import random
+from models.lang_vae import LanguageVAE
 
 os.environ['ROOT_DIR'] = '..'
 os.environ['HYDRA_FULL_ERROR'] = '1'
@@ -46,6 +47,23 @@ def train_ddp(rank, world_size, cfg):
     print(f'Training on {device}', flush=True)
     print('Initializing Distributed', flush=True)
     torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+
+    # Load VAE for language latent compression
+    lang_vae = None
+    if cfg.use_lang_vae and cfg.lang_vae_ckpt:
+        lang_vae = LanguageVAE(
+            input_dim=768,
+            latent_dim=64,
+            hidden_dim=256
+        ).to(device)
+        lang_vae.load_state_dict(torch.load(cfg.lang_vae_ckpt, map_location=device))
+        lang_vae.eval()
+        print(f'Loaded language VAE from {cfg.lang_vae_ckpt}', flush=True)
+        # Set language feature dim to 64 when using VAE
+        list(cfg.model.values())[0].language_feature_dim = 64
+    else:
+        # Set language feature dim to 768 when not using VAE
+        list(cfg.model.values())[0].language_feature_dim = 768
 
     model = init_model(list(cfg.model.values())[0], device=rank, eval=False, load_state_dict=cfg.load_state_dict)
 
@@ -140,6 +158,12 @@ def train_ddp(rank, world_size, cfg):
                 x_start.to(device), mat.to(device), scene_flag.to(device), lang_emb_start.to(device), \
                 pelvis_goal.to(device), hand_goal.to(device), is_pick.to(device), need_scene.to(device), \
                 need_pelvis_dir.to(device), is_loco.to(device)
+            
+            # Encode language embedding to 64-dim latent if VAE is used
+            if lang_vae is not None:
+                with torch.no_grad():
+                    lang_emb_start = lang_vae.encode_to_latent(lang_emb_start)  # (B, 64)
+                    lang_emb_start = lang_emb_start.unsqueeze(1)  # (B, 1, 64)
 
 
             t_motion = torch.randint(0, N_timesteps, (cfg.batch_size,), device=device).long()

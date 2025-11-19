@@ -50,6 +50,10 @@ load_pelvis_goal: true
 
 auto_regre_num: 2
 
+# Language VAE settings
+use_lang_vae: true
+lang_vae_ckpt: ${oc.env:ROOT_DIR}/results/lang_vae/checkpoints/lang_vae_bs128_lr0.0001_ld64_2025-11-17_16-08/best.pth
+
 num_gpus: 1
 num_workers: 0
 

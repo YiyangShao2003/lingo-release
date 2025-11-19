@@ -78,6 +78,17 @@ To run the code, you need to have the following installed:
     python sample_lingo.py
     ```
 
+    **Using Language VAE in Inference:**
+
+    To use the trained VAE during inference, edit `config/config_sample_lingo.yaml`:
+
+    ```yaml
+    use_lang_vae: true
+    lang_vae_ckpt: ../results/lang_vae/checkpoints/<run_id>/best.pth
+    ```
+
+    The sampling script will automatically encode/decode language embeddings when using the VAE.
+
 3. **Visualization in Blender**:
 
     Run `vis_output` in `vis.blend`.
@@ -106,11 +117,36 @@ Navigate to the `code` directory:
 cd code
 ```
 
-To start training the model, run the training script from the command line:
+### Training Language VAE (Optional)
+
+The Language VAE compresses language embeddings from 768 to 64 dimensions, reducing memory usage and improving training efficiency. To train the VAE:
+
+```bash
+python train_lang_vae.py
+```
+
+The VAE checkpoints will be saved in `../results/lang_vae/checkpoints/`. The best model is saved as `best.pth`.
+
+### Training Diffusion Model
+
+To start training the diffusion model, run:
 
 ```bash
 python train_lingo.py
 ```
+
+**Using Language VAE in Training:**
+
+To use the trained VAE during diffusion training, edit `config/config_train_lingo.yaml`:
+
+```yaml
+use_lang_vae: true
+lang_vae_ckpt: ../results/lang_vae/checkpoints/<run_id>/best.pth
+```
+
+When `use_lang_vae` is set to `true`, the training script will:
+- Automatically encode language embeddings to 64-dim before passing to the diffusion model
+- Set `language_feature_dim` to 64 in the model configuration
 
 The training script will automatically load the dataset, set up the model, and commence training sessions using the configurations in `./code/config` folder.
 

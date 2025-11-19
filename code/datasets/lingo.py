@@ -14,7 +14,21 @@ class LingoDataset(Dataset):
                  vis=True,
                  start_type='stand',
                  test_scene_name=None,
+                 lang_only=False,
                  **kwargs):
+
+        # Language-only mode is used for training the language VAE.
+        # In this mode, we avoid loading and computing motion / scene data
+        # that are never used, and only keep the language-related paths.
+        self.lang_only = lang_only
+
+        # If we are in language-only mode, force-disable scene / goal flags
+        # to make sure no downstream code accidentally relies on them.
+        if self.lang_only:
+            load_scene = False
+            load_pelvis_goal = False
+            load_hand_goal = False
+            use_pi = False
 
         self.folder = folder
         self.device = device
@@ -29,8 +43,10 @@ class LingoDataset(Dataset):
         self.test_scene_name = test_scene_name
         self.max_window_size = max_window_size
 
-        self.global_orient = np.load(os.path.join(folder, 'human_orient.npy'))
-        self.joints = np.load(os.path.join(folder, 'human_joints_aligned.npy'))
+        # These are only needed for motion / scene training, not for lang-only VAE.
+        if not self.lang_only:
+            self.global_orient = np.load(os.path.join(folder, 'human_orient.npy'))
+            self.joints = np.load(os.path.join(folder, 'human_joints_aligned.npy'))
 
         if self.load_language:
             if self.max_window_size == 16:
@@ -103,13 +119,15 @@ class LingoDataset(Dataset):
             self.batch_id = torch.linspace(0, batch_size - 1, batch_size).tile((nb_voxels[0]*nb_voxels[1]*nb_voxels[2], 1)).T \
                 .reshape(-1, 1).to(device=device, dtype=torch.long)
 
-        if self.max_window_size == 16:
-            norm = np.load(os.path.join(folder, 'norm_inter_and_loco__16frames.npy'))
+        # Normalization stats are only required when we use joints.
+        if not self.lang_only:
+            if self.max_window_size == 16:
+                norm = np.load(os.path.join(folder, 'norm_inter_and_loco__16frames.npy'))
 
-        self.min = norm[0].astype(np.float32)
-        self.max = norm[1].astype(np.float32)
-        self.min_torch = torch.tensor(self.min).to(device)
-        self.max_torch = torch.tensor(self.max).to(device)
+            self.min = norm[0].astype(np.float32)
+            self.max = norm[1].astype(np.float32)
+            self.min_torch = torch.tensor(self.min).to(device)
+            self.max_torch = torch.tensor(self.max).to(device)
 
     def __getitem__(self, idx):
         if self.load_language:
@@ -130,10 +148,10 @@ class LingoDataset(Dataset):
             left_hand_inter_frame = self.left_hand_inter_frame[idx]
             right_hand_inter_frame = self.right_hand_inter_frame[idx]
 
-            if left_hand_inter_frame != -1:
+            if left_hand_inter_frame != -1 and not self.lang_only:
                 hand_goal = self.joints[left_hand_inter_frame, 24].copy()  # left hand index1
                 is_pick = np.ones((1,)).astype(bool)
-            elif right_hand_inter_frame != -1:
+            elif right_hand_inter_frame != -1 and not self.lang_only:
                 hand_goal = self.joints[right_hand_inter_frame, 26].copy()  # right hand index1
                 is_pick = np.ones((1,)).astype(bool)
 
@@ -145,13 +163,42 @@ class LingoDataset(Dataset):
                 pi = pi + np.random.randint(-5, 5)
                 pi = max(pi, 0)
 
-            if need_pelvis_dir:
+            if need_pelvis_dir and not self.lang_only:
                 if 'sit down' in text or 'lie down' in text:
                     pelvis_goal = self.joints[int(self.end_range[idx]), 0].copy()
                 else:
                     pelvis_goal = self.joints[end_idx-3, 0].copy()
                     is_loco = True
                 pelvis_goal[1] = 0.
+
+        # In language-only mode we avoid all motion / scene computations and
+        # just return lightweight dummy placeholders for the unused fields.
+        if self.lang_only:
+            dummy_joints = np.zeros((1,), dtype=np.float32)
+            dummy_mat = np.eye(4, dtype=np.float32)
+            dummy_pelvis_goal = np.zeros((3,), dtype=np.float32)
+            dummy_hand_goal = np.zeros((3,), dtype=np.float32)
+            dummy_is_pick = np.zeros((1,), dtype=bool)
+            dummy_need_scene = False
+            dummy_need_pelvis_dir = False
+            dummy_pi = 0
+            dummy_need_pi = False
+            dummy_is_loco = False
+
+            return (
+                dummy_joints,
+                dummy_mat,
+                0,  # scene_flag
+                text_clip_embedding,
+                dummy_pelvis_goal,
+                dummy_hand_goal,
+                dummy_is_pick,
+                dummy_need_scene,
+                dummy_need_pelvis_dir,
+                int(dummy_pi),
+                dummy_need_pi,
+                dummy_is_loco,
+            )
 
         joints = self.joints[start_idx: end_idx: self.step]
         init_joints = np.array([joints[0, 0, 0], 0., joints[0, 0, 2]])

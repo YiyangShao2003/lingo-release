@@ -1,0 +1,38 @@
+defaults:
+  - dataset: lingo
+  - _self_
+
+exp_name: lang_vae
+train: true
+batch_size: 128
+lr: 0.0001
+epochs: 200
+device: cuda:0
+use_tensorboard: false
+use_wandb: true
+wandb_project: lang-vae-training
+ckpt_interval: 10
+
+exp_dir: ${oc.env:ROOT_DIR}/results/${exp_name}
+num_workers: 8
+
+# VAE parameters
+input_dim: 768
+latent_dim: 64
+hidden_dim: 256
+beta: 1.0
+
+# Dataset-related settings required by dataset/lingo.yaml
+max_window_size: 16
+vis: false
+start_type: stand
+load_language: true
+load_scene: false
+use_pi: false
+load_hand_goal: false
+load_pelvis_goal: false
+
+hydra:
+  run:
+    dir: ${exp_dir}
+
